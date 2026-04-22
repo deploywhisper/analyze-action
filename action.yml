@@ -1,0 +1,69 @@
+name: DeployWhisper Analyze Action
+description: Submit changed infrastructure artifacts from a GitHub pull request to DeployWhisper.
+author: DeployWhisper
+branding:
+  icon: shield
+  color: blue
+inputs:
+  api-url:
+    description: DeployWhisper base URL or explicit /api/v1/analyses endpoint.
+    required: true
+  api-token:
+    description: Optional bearer token for the DeployWhisper API.
+    required: false
+    default: ""
+  changed-files:
+    description: Optional comma or newline separated file list. Defaults to PR diff discovery.
+    required: false
+    default: ""
+  working-directory:
+    description: Repository path containing the checked-out pull request.
+    required: false
+    default: .
+outputs:
+  created:
+    description: Whether a DeployWhisper report was created.
+    value: ${{ steps.deploywhisper.outputs.created }}
+  changed-file-count:
+    description: Number of changed files detected for this run.
+    value: ${{ steps.deploywhisper.outputs.changed-file-count }}
+  submitted-artifact-count:
+    description: Number of supported artifacts uploaded to DeployWhisper.
+    value: ${{ steps.deploywhisper.outputs.submitted-artifact-count }}
+  accepted-artifact-count:
+    description: Number of artifacts accepted by the DeployWhisper API.
+    value: ${{ steps.deploywhisper.outputs.accepted-artifact-count }}
+  report-id:
+    description: Persisted DeployWhisper report identifier.
+    value: ${{ steps.deploywhisper.outputs.report-id }}
+  report-link:
+    description: Shareable report link when APP_BASE_URL is configured on the server.
+    value: ${{ steps.deploywhisper.outputs.report-link }}
+  severity:
+    description: Shared risk severity for the generated report.
+    value: ${{ steps.deploywhisper.outputs.severity }}
+  recommendation:
+    description: Shared deployment recommendation for the generated report.
+    value: ${{ steps.deploywhisper.outputs.recommendation }}
+  share-summary-json:
+    description: Machine-friendly share summary payload.
+    value: ${{ steps.deploywhisper.outputs.share-summary-json }}
+  share-summary-markdown:
+    description: Markdown advisory summary returned by DeployWhisper.
+    value: ${{ steps.deploywhisper.outputs.share-summary-markdown }}
+  skipped-files:
+    description: JSON array of changed files skipped before upload.
+    value: ${{ steps.deploywhisper.outputs.skipped-files }}
+runs:
+  using: composite
+  steps:
+    - id: deploywhisper
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}
+      run: |
+        python3 "${{ github.action_path }}/run_action.py" \
+          --api-url "${{ inputs.api-url }}" \
+          --api-token "${{ inputs.api-token }}" \
+          --changed-files "${{ inputs.changed-files }}" \
+          --working-directory "${{ inputs.working-directory }}"
