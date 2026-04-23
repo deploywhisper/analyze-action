@@ -51,6 +51,15 @@ outputs:
   share-summary-markdown:
     description: Markdown advisory summary returned by DeployWhisper.
     value: ${{ steps.deploywhisper.outputs.share-summary-markdown }}
+  comment-id:
+    description: Pull request comment identifier when the action posts or updates a comment.
+    value: ${{ steps.deploywhisper.outputs.comment-id }}
+  comment-url:
+    description: Pull request comment URL when the action posts or updates a comment.
+    value: ${{ steps.deploywhisper.outputs.comment-url }}
+  comment-updated:
+    description: Whether the action updated an existing PR comment instead of creating a new one.
+    value: ${{ steps.deploywhisper.outputs.comment-updated }}
   skipped-files:
     description: JSON array of changed files skipped before upload.
     value: ${{ steps.deploywhisper.outputs.skipped-files }}
@@ -60,6 +69,7 @@ runs:
     - id: deploywhisper
       shell: bash
       env:
+        GITHUB_TOKEN: ${{ github.token }}
         PYTHONPATH: ${{ github.action_path }}
       run: |
         python3 "${{ github.action_path }}/run_action.py" \

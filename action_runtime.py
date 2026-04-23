@@ -13,6 +13,8 @@ from typing import Iterable
 from urllib import error, parse, request
 import uuid
 
+COMMENT_MARKER = "<!-- deploywhisper:pr-comment -->"
+GITHUB_API_BASE_URL = "https://api.github.com"
 SENSITIVE_FILE_MARKERS = {
     ".env",
     ".pem",
@@ -33,6 +35,13 @@ SUPPORTED_TOOL_TYPES = {
 
 class ActionRuntimeError(RuntimeError):
     """Raised when the GitHub Action cannot complete its operational work."""
+
+
+def _shorten(text: str, limit: int) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(limit - 1, 0)].rstrip() + "…"
 
 
 def _split_changed_files(raw_value: str) -> list[str]:
@@ -309,6 +318,40 @@ def _http_json(request_obj: request.Request) -> dict:
         ) from exc
 
 
+def _github_api_json(
+    url: str,
+    *,
+    github_token: str,
+    method: str = "GET",
+    payload: dict | None = None,
+) -> dict | list[dict]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {github_token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with request.urlopen(req, timeout=120) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        response_body = exc.read().decode("utf-8", errors="ignore")
+        raise ActionRuntimeError(
+            f"GitHub API request failed with HTTP {exc.code}: "
+            f"{response_body or exc.reason}"
+        ) from exc
+    except error.URLError as exc:
+        raise ActionRuntimeError(
+            f"GitHub API request could not be completed: {exc.reason}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise ActionRuntimeError("GitHub API returned a non-JSON response.") from exc
+
+
 def submit_analysis(
     api_url: str,
     artifacts: list[tuple[str, bytes]],
@@ -331,6 +374,226 @@ def submit_analysis(
         headers["Authorization"] = f"Bearer {api_token}"
     req = request.Request(endpoint, data=body, headers=headers, method="POST")
     return _http_json(req)
+
+
+def _render_pr_comment(
+    share_summary: dict,
+    *,
+    headline_limit: int,
+    finding_title_limit: int,
+    summary_limit: int,
+    compact_links: bool = False,
+    compact_context: bool = False,
+) -> str:
+    json_payload = dict(share_summary.get("json_payload") or {})
+    verdict_banner = _shorten(
+        str(json_payload.get("verdict_banner") or "DeployWhisper advisory"), 80
+    )
+    headline = _shorten(
+        str(
+            json_payload.get("headline")
+            or share_summary.get("headline")
+            or "DeployWhisper analysis completed."
+        ),
+        headline_limit,
+    )
+    evidence_count = int(json_payload.get("evidence_count") or 0)
+    blast_radius_summary = _shorten(
+        str(json_payload.get("blast_radius_summary") or "No blast radius summary."),
+        summary_limit,
+    )
+    rollback_summary = _shorten(
+        str(json_payload.get("rollback_summary") or "Rollback summary unavailable."),
+        summary_limit,
+    )
+    advisory_summary = _shorten(
+        str(
+            json_payload.get("advisory_summary")
+            or "This result requires additional human review before release."
+        ),
+        summary_limit,
+    )
+    context = dict(json_payload.get("context_completeness") or {})
+    context_label = _shorten(str(context.get("label") or "UNKNOWN CONTEXT"), 32)
+    context_summary = _shorten(
+        str(context.get("summary") or "Context completeness unavailable."),
+        summary_limit,
+    )
+    report_link = str(json_payload.get("report_link") or "").strip()
+    rollback_link = str(json_payload.get("rollback_link") or "").strip()
+
+    top_findings = list(json_payload.get("top_findings") or [])[:3]
+    links_line = (
+        f"- Links: [Report]({report_link}) · [Rollback]({rollback_link})"
+        if compact_links and report_link and rollback_link
+        else (
+            f"- Links: [Open full report]({report_link}) · [View rollback plan]({rollback_link})"
+            if report_link and rollback_link
+            else (
+                f"- Link: [Open full report]({report_link})"
+                if report_link
+                else (
+                    f"- Link: [View rollback plan]({rollback_link})"
+                    if rollback_link
+                    else "- Link: Report unavailable"
+                )
+            )
+        )
+    )
+    lines = [
+        COMMENT_MARKER,
+        f"## {verdict_banner}",
+        f"**Summary:** {headline}",
+        f"- Evidence: {evidence_count} evidence items",
+        f"- Blast radius: {blast_radius_summary}",
+        links_line,
+        (
+            f"- Context: {context_label}"
+            if compact_context
+            else f"- Context: {context_label} · {context_summary}"
+        ),
+        "<details>",
+        "<summary>Top findings and advisory details</summary>",
+        "",
+    ]
+    if top_findings:
+        lines.extend(
+            f"- {str(finding.get('severity', 'medium')).upper()}: "
+            f"{_shorten(str(finding.get('title', 'Untitled finding')), finding_title_limit)} "
+            f"({int(finding.get('evidence_count') or 0)} evidence)"
+            for finding in top_findings
+        )
+    else:
+        lines.append("- No findings were returned in the share summary.")
+    lines.extend(
+        [
+            f"- Rollback summary: {rollback_summary}",
+            f"- Advisory only: {advisory_summary}",
+            "</details>",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_pr_comment(share_summary: dict) -> str:
+    """Format a GitHub-ready PR comment from the shared summary contract."""
+    candidates = [
+        _render_pr_comment(
+            share_summary,
+            headline_limit=120,
+            finding_title_limit=72,
+            summary_limit=120,
+        ),
+        _render_pr_comment(
+            share_summary,
+            headline_limit=96,
+            finding_title_limit=52,
+            summary_limit=72,
+            compact_links=True,
+        ),
+        _render_pr_comment(
+            share_summary,
+            headline_limit=72,
+            finding_title_limit=36,
+            summary_limit=48,
+            compact_links=True,
+            compact_context=True,
+        ),
+    ]
+    for comment in candidates:
+        if len(comment) <= 2000:
+            return comment
+
+    fallback = _render_pr_comment(
+        share_summary,
+        headline_limit=48,
+        finding_title_limit=24,
+        summary_limit=32,
+        compact_links=True,
+        compact_context=True,
+    )
+    if len(fallback) <= 2000:
+        return fallback
+    closing = "\n</details>"
+    opening, _, _ = fallback.rpartition(closing)
+    reserved = len(closing) + 8
+    available = max(2000 - reserved, 64)
+    return _shorten(opening, available).rstrip() + closing
+
+
+def _find_existing_pr_comment(
+    comments_url: str, *, github_token: str
+) -> dict[str, object] | None:
+    page = 1
+    while True:
+        comments = _github_api_json(
+            f"{comments_url}?per_page=100&page={page}",
+            github_token=github_token,
+        )
+        if not isinstance(comments, list):
+            raise ActionRuntimeError("GitHub issue-comments API returned an unexpected payload.")
+        existing_comment = next(
+            (
+                comment
+                for comment in comments
+                if COMMENT_MARKER in str(comment.get("body") or "")
+            ),
+            None,
+        )
+        if existing_comment is not None:
+            return existing_comment
+        if len(comments) < 100:
+            return None
+        page += 1
+
+
+def upsert_pr_comment(
+    context: dict[str, object], comment_body: str, *, github_token: str
+) -> dict[str, object]:
+    """Create or update the action's PR conversation comment."""
+    repository = str(context.get("repository") or "").strip()
+    pull_request_number = context.get("pull_request_number")
+    if not repository or pull_request_number is None:
+        raise ActionRuntimeError(
+            "Cannot post a PR comment without repository and pull request context."
+        )
+    if not github_token.strip():
+        raise ActionRuntimeError(
+            "GITHUB_TOKEN is required to post or update the pull request comment."
+        )
+
+    comments_url = (
+        f"{GITHUB_API_BASE_URL}/repos/{repository}/issues/{int(pull_request_number)}/comments"
+    )
+    existing_comment = _find_existing_pr_comment(
+        comments_url,
+        github_token=github_token,
+    )
+    if existing_comment:
+        comment_id = int(existing_comment["id"])
+        updated = _github_api_json(
+            f"{GITHUB_API_BASE_URL}/repos/{repository}/issues/comments/{comment_id}",
+            github_token=github_token,
+            method="PATCH",
+            payload={"body": comment_body},
+        )
+        return {
+            "id": int(updated["id"]),
+            "html_url": str(updated.get("html_url") or ""),
+            "updated": True,
+        }
+
+    created = _github_api_json(
+        comments_url,
+        github_token=github_token,
+        method="POST",
+        payload={"body": comment_body},
+    )
+    return {
+        "id": int(created["id"]),
+        "html_url": str(created.get("html_url") or ""),
+        "updated": False,
+    }
 
 
 def _write_env_file(path_value: str | None, key: str, value: str) -> None:
@@ -393,6 +656,16 @@ def _success_summary(
     if markdown:
         lines.extend(["", markdown])
     return "\n".join(lines)
+
+
+def _comment_warning_summary(message: str) -> str:
+    return "\n".join(
+        [
+            "## PR comment not published",
+            f"- Reason: {message}",
+            "- DeployWhisper analysis still completed successfully and remains advisory-only.",
+        ]
+    )
 
 
 def _skip_summary(reason: str, skipped_files: list[str]) -> str:
@@ -502,13 +775,40 @@ def run_action(args: argparse.Namespace, environ: dict[str, str] | None = None) 
     write_github_output(
         "share-summary-markdown", share_summary.get("markdown", ""), env
     )
-    write_step_summary(
+    extra_summary_sections: list[str] = []
+    pull_request_number = context.get("pull_request_number")
+    if pull_request_number is not None:
+        github_token = str(env.get("GITHUB_TOKEN") or "").strip()
+        if github_token:
+            try:
+                comment_result = upsert_pr_comment(
+                    context,
+                    build_pr_comment(share_summary),
+                    github_token=github_token,
+                )
+            except ActionRuntimeError as exc:
+                extra_summary_sections.append(_comment_warning_summary(str(exc)))
+            else:
+                write_github_output("comment-id", comment_result["id"], env)
+                write_github_output("comment-url", comment_result["html_url"], env)
+                write_github_output("comment-updated", comment_result["updated"], env)
+        else:
+            extra_summary_sections.append(
+                _comment_warning_summary(
+                    "GITHUB_TOKEN missing or not granted write access for pull request comments."
+                )
+            )
+    summary_sections = [
         _success_summary(
             analysis_payload=payload,
             changed_files=changed_files,
             uploaded_files=upload_files,
             skipped_files=skipped_files,
-        ),
+        )
+    ]
+    summary_sections.extend(extra_summary_sections)
+    write_step_summary(
+        "\n\n".join(summary_sections),
         env,
     )
     return 0
