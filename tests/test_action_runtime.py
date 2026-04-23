@@ -89,6 +89,72 @@ class BuildPrCommentTests(unittest.TestCase):
         self.assertIn("- HIGH:", comment)
         self.assertIn("- MEDIUM:", comment)
 
+    def test_build_pr_comment_keeps_scan_meta_when_fallback_compacts_long_comment(
+        self,
+    ) -> None:
+        share_summary = self._share_summary_payload()
+        share_summary["json_payload"]["blast_radius_summary"] = "Primary DB, " * 80
+        share_summary["json_payload"]["rollback_summary"] = "Manual rollback, " * 80
+        share_summary["json_payload"]["context_completeness"]["summary"] = (
+            "LIMITED CONTEXT " * 80
+        )
+        share_summary["json_payload"]["top_findings"][0]["title"] = (
+            "Critical finding " * 80
+        )
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report={
+                "id": 42,
+                "risk_score": 34,
+                "severity": "low",
+                "recommendation": "go",
+                "created_at": "2026-04-23T10:05:00+00:00",
+            },
+            previous_scan={
+                "report_id": 41,
+                "risk_score": 78,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T09:55:00+00:00",
+                "head_sha": "abcdef123456",
+            },
+            head_sha="fedcba654321",
+        )
+
+        self.assertLessEqual(len(comment), 2000)
+        self.assertIn("deploywhisper:scan-meta", comment)
+        self.assertIn('"report_id":42', comment.replace(" ", ""))
+        self.assertIn('"head_sha":"fedcba654321"', comment.replace(" ", ""))
+
+    def test_build_pr_comment_shows_previous_scan_diff_and_timestamps(self) -> None:
+        share_summary = self._share_summary_payload()
+        current_report = {
+            "id": 42,
+            "risk_score": 34,
+            "severity": "low",
+            "recommendation": "go",
+            "created_at": "2026-04-23T10:05:00+00:00",
+        }
+        previous_scan = {
+            "report_id": 41,
+            "risk_score": 78,
+            "severity": "high",
+            "recommendation": "no-go",
+            "created_at": "2026-04-23T09:55:00+00:00",
+            "head_sha": "abcdef123456",
+        }
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report=current_report,
+            previous_scan=previous_scan,
+        )
+
+        self.assertIn("Risk score changed 78 → 34, previously HIGH, now LOW", comment)
+        self.assertIn("Previous analysis: report #41", comment)
+        self.assertIn("Current analysis: report #42", comment)
+
 
 class UpsertPrCommentTests(unittest.TestCase):
     def _context(self) -> dict[str, object]:
@@ -219,6 +285,22 @@ class UpsertPrCommentTests(unittest.TestCase):
         self.assertTrue(any("page=2" in url for url in get_urls))
         self.assertEqual(requests[-1][0], "PATCH")
 
+    def test_extract_comment_metadata_reads_previous_scan_marker(self) -> None:
+        body = "\n".join(
+            [
+                "<!-- deploywhisper:pr-comment -->",
+                '<!-- deploywhisper:scan-meta {"report_id":41,"risk_score":78,"severity":"high","recommendation":"no-go","created_at":"2026-04-23T09:55:00+00:00","head_sha":"abcdef123456"} -->',
+                "existing body",
+            ]
+        )
+
+        metadata = action_runtime.extract_comment_metadata(body)
+
+        self.assertEqual(metadata["report_id"], 41)
+        self.assertEqual(metadata["risk_score"], 78)
+        self.assertEqual(metadata["severity"], "high")
+        self.assertEqual(metadata["head_sha"], "abcdef123456")
+
 
 class RunActionCommentTests(unittest.TestCase):
     def test_run_action_writes_comment_outputs_when_pull_request_comment_is_posted(
@@ -292,6 +374,10 @@ class RunActionCommentTests(unittest.TestCase):
                 patch(
                     "action_runtime.load_github_context",
                     return_value=context,
+                ),
+                patch(
+                    "action_runtime.find_existing_pr_comment",
+                    return_value=None,
                 ),
                 patch(
                     "action_runtime.upsert_pr_comment",
@@ -390,6 +476,117 @@ class RunActionCommentTests(unittest.TestCase):
             summary = summary_path.read_text(encoding="utf-8")
             self.assertIn("PR comment not published", summary)
             self.assertIn("permission denied", summary)
+
+    def test_run_action_marks_comment_as_updated_and_uses_previous_scan_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            output_path = repo_root / "github-output.txt"
+            summary_path = repo_root / "step-summary.md"
+            args = argparse.Namespace(
+                api_url="https://deploywhisper.example.com",
+                api_token="",
+                changed_files="plan.tf",
+                working_directory=str(repo_root),
+            )
+            analysis_payload = {
+                "meta": {"accepted_artifact_count": 1},
+                "data": {
+                    "persisted_report": {
+                        "id": 42,
+                        "risk_score": 34,
+                        "severity": "low",
+                        "recommendation": "go",
+                        "created_at": "2026-04-23T10:05:00+00:00",
+                    },
+                    "share_summary": {
+                        "severity": "low",
+                        "recommendation": "go",
+                        "markdown": "### DeployWhisper LOW · GO",
+                        "json_payload": {
+                            "verdict_banner": "DeployWhisper LOW · GO",
+                            "headline": "GO: ingress narrowed.",
+                            "top_findings": [
+                                {
+                                    "title": "Security group ingress narrowed",
+                                    "severity": "low",
+                                    "evidence_count": 1,
+                                    "confidence": 0.92,
+                                }
+                            ],
+                            "evidence_count": 1,
+                            "blast_radius_summary": "1 direct / 1 transitive",
+                            "rollback_summary": "2/5 LOW · First step: restore prior rule if needed",
+                            "context_completeness": {
+                                "score": 0.88,
+                                "label": "STRONG CONTEXT",
+                                "summary": "STRONG CONTEXT (0.88) - supporting topology and parser coverage look healthy.",
+                            },
+                            "report_link": "https://deploywhisper.example.com/history?report_id=42",
+                            "rollback_link": "https://deploywhisper.example.com/history?report_id=42",
+                            "advisory_summary": "Standard approval flow is sufficient.",
+                        },
+                    },
+                },
+            }
+            context = {
+                "event_name": "pull_request",
+                "repository": "deploywhisper/example-repo",
+                "pull_request_number": 17,
+                "head_sha": "abcdef1234567890",
+            }
+            existing_comment = {
+                "id": 777,
+                "body": "\n".join(
+                    [
+                        "<!-- deploywhisper:pr-comment -->",
+                        '<!-- deploywhisper:scan-meta {"report_id":41,"risk_score":78,"severity":"high","recommendation":"no-go","created_at":"2026-04-23T09:55:00+00:00","head_sha":"abcdef123456"} -->',
+                        "existing body",
+                    ]
+                ),
+            }
+            captured_comment: dict[str, str] = {}
+            environ = {
+                "GITHUB_OUTPUT": str(output_path),
+                "GITHUB_STEP_SUMMARY": str(summary_path),
+                "GITHUB_TOKEN": "ghs_test",
+            }
+
+            def fake_upsert(context, comment_body, *, github_token, existing_comment=None):
+                captured_comment["body"] = comment_body
+                return {
+                    "id": 777,
+                    "html_url": "https://github.com/deploywhisper/example-repo/issues/17#issuecomment-777",
+                    "updated": True,
+                }
+
+            with (
+                patch(
+                    "action_runtime.select_artifacts_for_upload",
+                    return_value=([("plan.tf", b"resource")], []),
+                ),
+                patch(
+                    "action_runtime.submit_analysis",
+                    return_value=analysis_payload,
+                ),
+                patch(
+                    "action_runtime.load_github_context",
+                    return_value=context,
+                ),
+                patch(
+                    "action_runtime.find_existing_pr_comment",
+                    return_value=existing_comment,
+                ),
+                patch(
+                    "action_runtime.upsert_pr_comment",
+                    side_effect=fake_upsert,
+                ),
+            ):
+                exit_code = action_runtime.run_action(args, environ=environ)
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("Risk score changed 78 → 34, previously HIGH, now LOW", captured_comment["body"])
+            output = output_path.read_text(encoding="utf-8")
+            self.assertIn("comment-updated=true", output)
 
 
 if __name__ == "__main__":
