@@ -64,6 +64,7 @@ Outputs:
 - filters to supported DeployWhisper artifacts locally before upload
 - submits those artifacts to `POST /api/v1/analyses`
 - posts a single markdown PR comment and updates that same comment on re-runs
+- compares the latest report with the previous PR scan so the updated comment shows score and severity changes
 - exits `0` when analysis succeeds, regardless of risk verdict
 - uses only Python standard library modules inside the action runtime
 

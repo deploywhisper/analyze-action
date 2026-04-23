@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ from urllib import error, parse, request
 import uuid
 
 COMMENT_MARKER = "<!-- deploywhisper:pr-comment -->"
+SCAN_META_MARKER = "deploywhisper:scan-meta"
 GITHUB_API_BASE_URL = "https://api.github.com"
 SENSITIVE_FILE_MARKERS = {
     ".env",
@@ -42,6 +44,18 @@ def _shorten(text: str, limit: int) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: max(limit - 1, 0)].rstrip() + "…"
+
+
+def _format_timestamp(value: str | None) -> str:
+    if not value:
+        return "timestamp unavailable"
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _split_changed_files(raw_value: str) -> list[str]:
@@ -376,9 +390,67 @@ def submit_analysis(
     return _http_json(req)
 
 
+def _scan_meta_marker(scan_meta: dict[str, object]) -> str:
+    return f"<!-- {SCAN_META_MARKER} {json.dumps(scan_meta, separators=(',', ':'))} -->"
+
+
+def extract_comment_metadata(comment_body: str) -> dict[str, object] | None:
+    match = re.search(
+        r"<!--\s*deploywhisper:scan-meta\s+(\{.*?\})\s*-->",
+        comment_body,
+        re.DOTALL,
+    )
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _current_scan_meta(
+    current_report: dict[str, object], *, head_sha: str | None
+) -> dict[str, object]:
+    return {
+        "report_id": int(current_report.get("id") or 0),
+        "risk_score": int(current_report.get("risk_score") or 0),
+        "severity": str(current_report.get("severity") or "").lower(),
+        "recommendation": str(current_report.get("recommendation") or "").lower(),
+        "created_at": str(current_report.get("created_at") or ""),
+        "head_sha": (head_sha or "")[:12],
+    }
+
+
+def _previous_scan_summary(
+    previous_scan: dict[str, object] | None, current_report: dict[str, object] | None
+) -> list[str]:
+    if not previous_scan or not current_report:
+        return []
+    previous_score = int(previous_scan.get("risk_score") or 0)
+    current_score = int(current_report.get("risk_score") or 0)
+    previous_severity = str(previous_scan.get("severity") or "unknown").upper()
+    current_severity = str(current_report.get("severity") or "unknown").upper()
+    previous_report_id = int(previous_scan.get("report_id") or 0)
+    lines = [
+        (
+            f"- Change since last scan: Risk score changed {previous_score} → {current_score}, "
+            f"previously {previous_severity}, now {current_severity}"
+        ),
+        (
+            f"- Previous analysis: report #{previous_report_id} at "
+            f"{_format_timestamp(str(previous_scan.get('created_at') or ''))}"
+        ),
+    ]
+    return lines
+
+
 def _render_pr_comment(
     share_summary: dict,
     *,
+    current_report: dict[str, object] | None,
+    previous_scan: dict[str, object] | None,
+    head_sha: str | None,
     headline_limit: int,
     finding_title_limit: int,
     summary_limit: int,
@@ -423,6 +495,14 @@ def _render_pr_comment(
     rollback_link = str(json_payload.get("rollback_link") or "").strip()
 
     top_findings = list(json_payload.get("top_findings") or [])[:3]
+    current_scan_lines = []
+    if current_report:
+        current_report_id = int(current_report.get("id") or 0)
+        current_scan_lines.append(
+            f"- Current analysis: report #{current_report_id} at "
+            f"{_format_timestamp(str(current_report.get('created_at') or ''))}"
+        )
+    current_scan_lines.extend(_previous_scan_summary(previous_scan, current_report))
     links_line = (
         f"- Links: [Report]({report_link}) · [Rollback]({rollback_link})"
         if compact_links and report_link and rollback_link
@@ -452,6 +532,7 @@ def _render_pr_comment(
             if compact_context
             else f"- Context: {context_label} · {context_summary}"
         ),
+        *current_scan_lines,
         "<details>",
         "<summary>Top findings and advisory details</summary>",
         "",
@@ -472,20 +553,34 @@ def _render_pr_comment(
             "</details>",
         ]
     )
+    if current_report:
+        lines.append(_scan_meta_marker(_current_scan_meta(current_report, head_sha=head_sha)))
     return "\n".join(lines)
 
 
-def build_pr_comment(share_summary: dict) -> str:
+def build_pr_comment(
+    share_summary: dict,
+    *,
+    current_report: dict[str, object] | None = None,
+    previous_scan: dict[str, object] | None = None,
+    head_sha: str | None = None,
+) -> str:
     """Format a GitHub-ready PR comment from the shared summary contract."""
     candidates = [
         _render_pr_comment(
             share_summary,
+            current_report=current_report,
+            previous_scan=previous_scan,
+            head_sha=head_sha,
             headline_limit=120,
             finding_title_limit=72,
             summary_limit=120,
         ),
         _render_pr_comment(
             share_summary,
+            current_report=current_report,
+            previous_scan=previous_scan,
+            head_sha=head_sha,
             headline_limit=96,
             finding_title_limit=52,
             summary_limit=72,
@@ -493,6 +588,9 @@ def build_pr_comment(share_summary: dict) -> str:
         ),
         _render_pr_comment(
             share_summary,
+            current_report=current_report,
+            previous_scan=previous_scan,
+            head_sha=head_sha,
             headline_limit=72,
             finding_title_limit=36,
             summary_limit=48,
@@ -506,6 +604,9 @@ def build_pr_comment(share_summary: dict) -> str:
 
     fallback = _render_pr_comment(
         share_summary,
+        current_report=current_report,
+        previous_scan=previous_scan,
+        head_sha=head_sha,
         headline_limit=48,
         finding_title_limit=24,
         summary_limit=32,
@@ -514,11 +615,17 @@ def build_pr_comment(share_summary: dict) -> str:
     )
     if len(fallback) <= 2000:
         return fallback
+    meta_prefix = f"\n<!-- {SCAN_META_MARKER} "
+    meta_suffix = ""
+    meta_index = fallback.rfind(meta_prefix)
+    if meta_index != -1:
+        meta_suffix = fallback[meta_index:]
+        fallback = fallback[:meta_index]
     closing = "\n</details>"
     opening, _, _ = fallback.rpartition(closing)
-    reserved = len(closing) + 8
+    reserved = len(closing) + len(meta_suffix) + 8
     available = max(2000 - reserved, 64)
-    return _shorten(opening, available).rstrip() + closing
+    return _shorten(opening, available).rstrip() + closing + meta_suffix
 
 
 def _find_existing_pr_comment(
@@ -547,8 +654,28 @@ def _find_existing_pr_comment(
         page += 1
 
 
+def find_existing_pr_comment(
+    context: dict[str, object], *, github_token: str
+) -> dict[str, object] | None:
+    repository = str(context.get("repository") or "").strip()
+    pull_request_number = context.get("pull_request_number")
+    if not repository or pull_request_number is None:
+        return None
+    comments_url = (
+        f"{GITHUB_API_BASE_URL}/repos/{repository}/issues/{int(pull_request_number)}/comments"
+    )
+    return _find_existing_pr_comment(
+        comments_url,
+        github_token=github_token,
+    )
+
+
 def upsert_pr_comment(
-    context: dict[str, object], comment_body: str, *, github_token: str
+    context: dict[str, object],
+    comment_body: str,
+    *,
+    github_token: str,
+    existing_comment: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Create or update the action's PR conversation comment."""
     repository = str(context.get("repository") or "").strip()
@@ -565,10 +692,11 @@ def upsert_pr_comment(
     comments_url = (
         f"{GITHUB_API_BASE_URL}/repos/{repository}/issues/{int(pull_request_number)}/comments"
     )
-    existing_comment = _find_existing_pr_comment(
-        comments_url,
-        github_token=github_token,
-    )
+    if existing_comment is None:
+        existing_comment = _find_existing_pr_comment(
+            comments_url,
+            github_token=github_token,
+        )
     if existing_comment:
         comment_id = int(existing_comment["id"])
         updated = _github_api_json(
@@ -781,10 +909,23 @@ def run_action(args: argparse.Namespace, environ: dict[str, str] | None = None) 
         github_token = str(env.get("GITHUB_TOKEN") or "").strip()
         if github_token:
             try:
+                existing_comment = find_existing_pr_comment(
+                    context,
+                    github_token=github_token,
+                )
+                previous_scan = extract_comment_metadata(
+                    str(existing_comment.get("body") or "")
+                ) if existing_comment else None
                 comment_result = upsert_pr_comment(
                     context,
-                    build_pr_comment(share_summary),
+                    build_pr_comment(
+                        share_summary,
+                        current_report=persisted_report,
+                        previous_scan=previous_scan,
+                        head_sha=str(context.get("head_sha") or context.get("sha") or ""),
+                    ),
                     github_token=github_token,
+                    existing_comment=existing_comment,
                 )
             except ActionRuntimeError as exc:
                 extra_summary_sections.append(_comment_warning_summary(str(exc)))
