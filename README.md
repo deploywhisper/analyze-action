@@ -13,6 +13,16 @@ public Marketplace repository:
 ## Usage
 
 ```yaml
+name: DeployWhisper
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   deploywhisper:
     runs-on: ubuntu-latest
@@ -43,6 +53,9 @@ Outputs:
 - `recommendation`
 - `share-summary-json`
 - `share-summary-markdown`
+- `comment-id`
+- `comment-url`
+- `comment-updated`
 - `skipped-files`
 
 ## Behavior
@@ -50,6 +63,7 @@ Outputs:
 - detects changed files from the pull-request diff
 - filters to supported DeployWhisper artifacts locally before upload
 - submits those artifacts to `POST /api/v1/analyses`
+- posts a single markdown PR comment and updates that same comment on re-runs
 - exits `0` when analysis succeeds, regardless of risk verdict
 - uses only Python standard library modules inside the action runtime
 
