@@ -3,7 +3,7 @@ description: Submit changed infrastructure artifacts from a GitHub pull request 
 author: DeployWhisper
 branding:
   icon: shield
-  color: blue
+  color: orange
 inputs:
   api-url:
     description: DeployWhisper base URL or explicit /api/v1/analyses endpoint.
