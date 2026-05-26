@@ -80,6 +80,9 @@ jobs:
 - Detects changed files from the pull request diff.
 - Filters unsupported and sensitive files locally before upload.
 - Submits explicit project and optional workspace scope when configured.
+- Posts a concise advisory PR comment with verdict, Evidence Law status,
+  top risks with evidence counts, blast radius, rollback, incident/public
+  pattern matches, scanner context, uncertainty, and report links.
 - Compares the latest report with the previous PR scan when the scan marker is
   valid, including same-commit reruns where rules, parsers, incidents, or inputs
   may have changed.

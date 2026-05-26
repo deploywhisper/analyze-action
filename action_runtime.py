@@ -578,6 +578,192 @@ def _previous_scan_summary(
     return lines
 
 
+def _finding_evidence_count(finding: dict, evidence_items: list[dict[str, object]]) -> int:
+    evidence_refs = finding.get("evidence_refs")
+    if isinstance(evidence_refs, list):
+        return len([item for item in evidence_refs if _nonblank_string(item)])
+    raw_count = finding.get("evidence_count")
+    if isinstance(raw_count, int) and not isinstance(raw_count, bool):
+        return raw_count
+    finding_id = _nonblank_string(finding.get("finding_id")) or _nonblank_string(
+        finding.get("id")
+    )
+    if not finding_id:
+        return 0
+    return sum(
+        1
+        for evidence_item in evidence_items
+        if _nonblank_string(evidence_item.get("finding_id")) == finding_id
+    )
+
+
+def _derive_evidence_law(
+    json_payload: dict,
+    current_report: dict[str, object] | None,
+) -> tuple[str, str]:
+    report_findings = (
+        current_report.get("findings") if isinstance(current_report, dict) else None
+    )
+    findings = report_findings if isinstance(report_findings, list) else []
+    if not findings:
+        findings = list(json_payload.get("top_findings") or [])
+    evidence_items = (
+        current_report.get("evidence_items")
+        if isinstance(current_report, dict)
+        else None
+    )
+    evidence_rows = (
+        [item for item in evidence_items if isinstance(item, dict)]
+        if isinstance(evidence_items, list)
+        else []
+    )
+    severe_findings = [
+        finding
+        for finding in findings
+        if isinstance(finding, dict)
+        and _nonblank_string(finding.get("severity")).lower() in {"high", "critical"}
+    ]
+    if not severe_findings:
+        return (
+            "Satisfied",
+            "No high or critical findings require Evidence Law support.",
+        )
+    unsupported_count = sum(
+        1
+        for finding in severe_findings
+        if _finding_evidence_count(finding, evidence_rows) <= 0
+    )
+    if unsupported_count:
+        return (
+            "Needs review",
+            f"{unsupported_count} high or critical finding(s) lack linked evidence.",
+        )
+    return (
+        "Satisfied",
+        "High and critical findings have linked evidence in this report.",
+    )
+
+
+def _evidence_law_summary(
+    json_payload: dict,
+    current_report: dict[str, object] | None,
+    *,
+    limit: int,
+) -> str:
+    derived_status, derived_detail = _derive_evidence_law(json_payload, current_report)
+    status = _nonblank_string(json_payload.get("evidence_law_status")) or derived_status
+    detail = _shorten(
+        _nonblank_string(json_payload.get("evidence_law_detail")) or derived_detail,
+        limit,
+    )
+    return f"Evidence Law: {status} - {detail}"
+
+
+def _pattern_match_summary(
+    current_report: dict[str, object] | None, *, limit: int
+) -> str:
+    if not current_report:
+        return "Pattern matches: not available in this action response."
+    matches = current_report.get("incident_matches")
+    if not isinstance(matches, list) or not matches:
+        return "Pattern matches: none returned."
+
+    labels: list[str] = []
+    for raw_match in matches[:2]:
+        if not isinstance(raw_match, dict):
+            continue
+        match_type = _nonblank_string(raw_match.get("match_type"))
+        if match_type == "public_risk_pattern":
+            match_label = (
+                "public pattern "
+                + (
+                    _nonblank_string(raw_match.get("public_pattern_id"))
+                    or "unidentified"
+                )
+            )
+        elif raw_match.get("incident_id") is not None:
+            match_label = f"organization incident #{raw_match.get('incident_id')}"
+        else:
+            match_label = match_type.replace("_", " ") or "matched pattern"
+        confidence = _nonblank_string(raw_match.get("confidence_label"))
+        summary = _nonblank_string(raw_match.get("summary")) or _nonblank_string(
+            raw_match.get("reason")
+        )
+        suffix_parts = [part for part in (confidence, _shorten(summary, limit)) if part]
+        labels.append(
+            match_label
+            if not suffix_parts
+            else f"{match_label} ({'; '.join(suffix_parts)})"
+        )
+
+    if not labels:
+        return "Pattern matches: none returned."
+    extra = len(matches) - len(labels)
+    suffix = f"; +{extra} more" if extra > 0 else ""
+    return "Pattern matches: " + "; ".join(labels) + suffix
+
+
+def _scanner_context_summary(current_report: dict[str, object] | None) -> str:
+    if not current_report:
+        return "Scanner context: not available in this action response."
+
+    parse_batch = current_report.get("parse_batch")
+    if isinstance(parse_batch, dict):
+        files = parse_batch.get("files")
+        if isinstance(files, list) and files:
+            totals: dict[str, int] = {}
+            parsed: dict[str, int] = {}
+            for raw_file in files:
+                if not isinstance(raw_file, dict):
+                    continue
+                tool = _nonblank_string(raw_file.get("tool")) or "unknown"
+                totals[tool] = totals.get(tool, 0) + 1
+                if _nonblank_string(raw_file.get("status")).lower() == "parsed":
+                    parsed[tool] = parsed.get(tool, 0) + 1
+            if totals:
+                return "Scanner context: " + "; ".join(
+                    f"{tool} {parsed.get(tool, 0)}/{total} parsed"
+                    for tool, total in totals.items()
+                )
+
+    context = current_report.get("context_completeness")
+    if isinstance(context, dict):
+        parser_success = context.get("parser_success_by_tool")
+        if isinstance(parser_success, dict) and parser_success:
+            parts = [
+                f"{tool} {round(float(rate) * 100)}% parser success"
+                for tool, rate in sorted(parser_success.items())
+                if isinstance(rate, (int, float)) and not isinstance(rate, bool)
+            ]
+            if parts:
+                return "Scanner context: " + "; ".join(parts)
+
+    return "Scanner context: unavailable."
+
+
+def _uncertainty_summary(
+    json_payload: dict,
+    current_report: dict[str, object] | None,
+    *,
+    limit: int,
+) -> str:
+    context = (
+        current_report.get("context_completeness")
+        if isinstance(current_report, dict)
+        else None
+    )
+    uncertainty = (
+        _nonblank_string(context.get("uncertainty"))
+        if isinstance(context, dict)
+        else ""
+    )
+    if not uncertainty:
+        uncertainty = _nonblank_string(json_payload.get("advisory_summary"))
+    if not uncertainty:
+        uncertainty = "No additional uncertainty detail was returned."
+    return "Uncertainty: " + _shorten(uncertainty, limit)
+
+
 def _render_pr_comment(
     share_summary: dict,
     *,
@@ -664,7 +850,13 @@ def _render_pr_comment(
         f"## {verdict_banner}",
         f"**Summary:** {headline}",
         f"- Evidence: {evidence_count} evidence items",
+        f"- {_evidence_law_summary(json_payload, current_report, limit=summary_limit)}",
         f"- Blast radius: {blast_radius_summary}",
+        f"- Rollback: {rollback_summary}",
+        f"- {_pattern_match_summary(current_report, limit=summary_limit)}",
+        f"- {_scanner_context_summary(current_report)}",
+        f"- {_uncertainty_summary(json_payload, current_report, limit=summary_limit)}",
+        "- Advisory: advisory-only; does not block merge.",
         links_line,
         (
             f"- Context: {context_label}"
@@ -673,7 +865,7 @@ def _render_pr_comment(
         ),
         *current_scan_lines,
         "<details>",
-        "<summary>Top findings and advisory details</summary>",
+        "<summary>Top risks and evidence</summary>",
         "",
     ]
     if top_findings:

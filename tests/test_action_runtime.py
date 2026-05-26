@@ -44,6 +44,8 @@ class BuildPrCommentTests(unittest.TestCase):
                         "confidence": 0.72,
                     },
                 ],
+                "evidence_law_status": "Satisfied",
+                "evidence_law_detail": "High and critical findings are backed by deterministic evidence.",
                 "evidence_count": 6,
                 "blast_radius_summary": "2 direct / 4 transitive (Primary DB, Worker Queue, Checkout API)",
                 "rollback_summary": "4/5 HIGH · First step: restore the previous security group rule set",
@@ -56,6 +58,53 @@ class BuildPrCommentTests(unittest.TestCase):
                 "rollback_link": "https://deploywhisper.example.com/history?report_id=42",
                 "advisory_summary": "This result requires additional human review before release.",
             },
+        }
+
+    def _persisted_report_payload(self) -> dict:
+        return {
+            "id": 42,
+            "risk_score": 78,
+            "severity": "high",
+            "recommendation": "no-go",
+            "created_at": "2026-04-23T10:05:00+00:00",
+            "findings": [
+                {
+                    "finding_id": "finding-1",
+                    "title": "Database security group widens ingress to 0.0.0.0/0",
+                    "severity": "critical",
+                    "evidence_refs": ["evidence-1"],
+                }
+            ],
+            "evidence_items": [
+                {
+                    "evidence_id": "evidence-1",
+                    "finding_id": "finding-1",
+                }
+            ],
+            "parse_batch": {
+                "files": [
+                    {"tool": "terraform", "status": "parsed"},
+                    {"tool": "kubernetes", "status": "error"},
+                ]
+            },
+            "context_completeness": {
+                "parser_success_by_tool": {"terraform": 1.0, "kubernetes": 0.0},
+                "uncertainty": "Parser coverage is partial and incident history is stale.",
+            },
+            "incident_matches": [
+                {
+                    "match_type": "public_risk_pattern",
+                    "public_pattern_id": "public-ingress-wide-open",
+                    "summary": "Public risk pattern match: wide-open ingress has caused deployment incidents.",
+                    "confidence_label": "high",
+                },
+                {
+                    "match_type": "organization_incident",
+                    "incident_id": 81,
+                    "summary": "Prior checkout outage involved a security group rollback.",
+                    "confidence_label": "medium",
+                },
+            ],
         }
 
     def test_build_pr_comment_includes_story_fields_and_collapsible_details(self) -> None:
@@ -183,6 +232,38 @@ class BuildPrCommentTests(unittest.TestCase):
 
         self.assertIn("same commit was scanned again", comment)
         self.assertIn("Risk score changed 78 → 34", comment)
+
+    def test_build_pr_comment_includes_full_advisory_context(self) -> None:
+        comment = action_runtime.build_pr_comment(
+            self._share_summary_payload(),
+            current_report=self._persisted_report_payload(),
+        )
+
+        self.assertIn("Evidence Law: Satisfied", comment)
+        self.assertIn("High and critical findings are backed", comment)
+        self.assertIn("Top risks and evidence", comment)
+        self.assertIn("CRITICAL: Database security group widens ingress", comment)
+        self.assertIn("Pattern matches: public pattern public-ingress-wide-open", comment)
+        self.assertIn("organization incident #81", comment)
+        self.assertIn("Scanner context: terraform 1/1 parsed; kubernetes 0/1 parsed", comment)
+        self.assertIn("Uncertainty: Parser coverage is partial", comment)
+        self.assertIn("Advisory: advisory-only; does not block merge.", comment)
+        self.assertIn("[Open full report]", comment)
+
+    def test_build_pr_comment_derives_evidence_law_when_summary_omits_it(
+        self,
+    ) -> None:
+        share_summary = json.loads(json.dumps(self._share_summary_payload()))
+        del share_summary["json_payload"]["evidence_law_status"]
+        del share_summary["json_payload"]["evidence_law_detail"]
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report=self._persisted_report_payload(),
+        )
+
+        self.assertIn("Evidence Law: Satisfied", comment)
+        self.assertIn("High and critical findings have linked evidence", comment)
 
 
 class UpsertPrCommentTests(unittest.TestCase):
