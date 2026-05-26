@@ -233,6 +233,62 @@ class BuildPrCommentTests(unittest.TestCase):
         self.assertIn("same commit was scanned again", comment)
         self.assertIn("Risk score changed 78 → 34", comment)
 
+    def test_build_pr_comment_highlights_new_resolved_and_persistent_findings(
+        self,
+    ) -> None:
+        share_summary = self._share_summary_payload()
+        current_report = self._persisted_report_payload()
+        current_report["findings"] = [
+            {
+                "finding_id": "finding-persistent-new-id",
+                "title": "Database security group widens ingress to 0.0.0.0/0",
+                "severity": "critical",
+                "evidence_refs": ["evidence-1"],
+            },
+            {
+                "finding_id": "finding-new",
+                "title": "EKS control plane public endpoint lacks CIDR restrictions",
+                "severity": "high",
+                "evidence_refs": ["evidence-2"],
+            },
+        ]
+        current_report["evidence_items"] = [
+            {"evidence_id": "evidence-1", "finding_id": "finding-persistent-new-id"},
+            {"evidence_id": "evidence-2", "finding_id": "finding-new"},
+        ]
+        previous_scan = {
+            "report_id": 41,
+            "risk_score": 72,
+            "severity": "high",
+            "recommendation": "no-go",
+            "created_at": "2026-04-23T09:55:00+00:00",
+            "head_sha": "abcdef123456",
+            "findings": [
+                {
+                    "title": "Database security group widens ingress to 0.0.0.0/0",
+                    "severity": "critical",
+                },
+                {
+                    "title": "Rollback depends on a manual security group replacement",
+                    "severity": "medium",
+                },
+            ],
+        }
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report=current_report,
+            previous_scan=previous_scan,
+            head_sha="fedcba654321",
+        )
+
+        self.assertIn("Finding changes: 1 new / 1 resolved / 1 persistent", comment)
+        self.assertIn("New finding: HIGH EKS control plane", comment)
+        self.assertIn("Resolved finding: MEDIUM Rollback depends", comment)
+        self.assertIn("Persistent finding: CRITICAL Database security group", comment)
+        self.assertIn('"findings":[', comment.replace(" ", ""))
+        self.assertLessEqual(len(comment), 2000)
+
     def test_build_pr_comment_includes_full_advisory_context(self) -> None:
         comment = action_runtime.build_pr_comment(
             self._share_summary_payload(),
@@ -546,7 +602,7 @@ class UpsertPrCommentTests(unittest.TestCase):
         body = "\n".join(
             [
                 "<!-- deploywhisper:pr-comment -->",
-                '<!-- deploywhisper:scan-meta {"report_id":41,"risk_score":78,"severity":"high","recommendation":"no-go","created_at":"2026-04-23T09:55:00+00:00","head_sha":"abcdef123456"} -->',
+                '<!-- deploywhisper:scan-meta {"report_id":41,"risk_score":78,"severity":"high","recommendation":"no-go","created_at":"2026-04-23T09:55:00+00:00","head_sha":"abcdef123456","findings":[{"title":"Database security group widens ingress","severity":"critical"},{"title":"Rollback depends on manual replacement","severity":"medium"}]} -->',
                 "existing body",
             ]
         )
@@ -557,6 +613,9 @@ class UpsertPrCommentTests(unittest.TestCase):
         self.assertEqual(metadata["risk_score"], 78)
         self.assertEqual(metadata["severity"], "high")
         self.assertEqual(metadata["head_sha"], "abcdef123456")
+        self.assertEqual(len(metadata["findings"]), 2)
+        self.assertEqual(metadata["findings"][0]["severity"], "critical")
+        self.assertIn("Database security group", metadata["findings"][0]["title"])
 
     def test_extract_comment_metadata_ignores_malformed_scan_marker(self) -> None:
         body = "\n".join(

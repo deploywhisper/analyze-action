@@ -514,6 +514,7 @@ def extract_comment_metadata(comment_body: str) -> dict[str, object] | None:
             "recommendation": str(payload.get("recommendation") or "").lower(),
             "created_at": str(payload.get("created_at") or ""),
             "head_sha": str(payload.get("head_sha") or ""),
+            "findings": _scan_meta_findings(payload.get("findings")),
         }
     except (KeyError, TypeError, ValueError):
         return None
@@ -529,6 +530,7 @@ def _current_scan_meta(
         "recommendation": str(current_report.get("recommendation") or "").lower(),
         "created_at": str(current_report.get("created_at") or ""),
         "head_sha": head_sha or "",
+        "findings": _scan_meta_findings(current_report.get("findings")),
     }
 
 
@@ -603,6 +605,127 @@ def _finite_rate(value: object) -> float | None:
         return None
     rate = float(value)
     return rate if math.isfinite(rate) else None
+
+
+def _scan_meta_text(value: object, limit: int) -> str:
+    text = _shorten(_single_line_string(value), limit)
+    return (
+        text.replace("<!--", "")
+        .replace("-->", "")
+        .replace("<", "")
+        .replace(">", "")
+    )
+
+
+def _finding_title(finding: dict[str, object]) -> str:
+    return (
+        _nonblank_string(finding.get("title"))
+        or _nonblank_string(finding.get("description"))
+        or _nonblank_string(finding.get("summary"))
+        or _nonblank_string(finding.get("finding_id"))
+        or _nonblank_string(finding.get("id"))
+    )
+
+
+def _finding_severity(finding: dict[str, object]) -> str:
+    severity = _single_line_string(finding.get("severity")).lower()
+    return severity or "unknown"
+
+
+def _finding_identity_key(finding: dict[str, object]) -> str:
+    existing_key = _nonblank_string(finding.get("key"))
+    if existing_key:
+        return existing_key
+    title = _finding_title(finding)
+    if not title:
+        return ""
+    category = (
+        _nonblank_string(finding.get("category"))
+        or _nonblank_string(finding.get("resource_category"))
+    )
+    identity = f"{category}|{title}".lower()
+    return re.sub(r"[^a-z0-9]+", " ", identity).strip()
+
+
+def _scan_meta_findings(value: object, *, limit: int = 12) -> list[dict[str, str]]:
+    findings: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw_finding in _dict_items(value):
+        if len(findings) >= limit:
+            break
+        key = _finding_identity_key(raw_finding)
+        title = _finding_title(raw_finding)
+        if not key or key in seen or not title:
+            continue
+        seen.add(key)
+        findings.append(
+            {
+                "key": key,
+                "severity": _scan_meta_text(_finding_severity(raw_finding), 16),
+                "title": _scan_meta_text(title, 96),
+            }
+        )
+    return findings
+
+
+def _finding_lookup(value: object) -> dict[str, dict[str, str]]:
+    return {
+        item["key"]: item
+        for item in _scan_meta_findings(value)
+        if _nonblank_string(item.get("key"))
+    }
+
+
+def _finding_delta(
+    previous_scan: dict[str, object] | None,
+    current_report: dict[str, object] | None,
+) -> dict[str, list[dict[str, str]]]:
+    if not previous_scan or not current_report:
+        return {"new": [], "resolved": [], "persistent": []}
+    previous = _finding_lookup(previous_scan.get("findings"))
+    current = _finding_lookup(current_report.get("findings"))
+    if not previous or not current:
+        return {"new": [], "resolved": [], "persistent": []}
+    previous_keys = set(previous)
+    current_keys = set(current)
+    return {
+        "new": [current[key] for key in current if key not in previous_keys],
+        "resolved": [previous[key] for key in previous if key not in current_keys],
+        "persistent": [current[key] for key in current if key in previous_keys],
+    }
+
+
+def _finding_label(finding: dict[str, str], *, limit: int) -> str:
+    severity = _markdown_text(finding.get("severity")).upper() or "UNKNOWN"
+    title = _shorten(_markdown_text(finding.get("title") or "Untitled finding"), limit)
+    return f"{severity} {title}"
+
+
+def _finding_delta_lines(
+    previous_scan: dict[str, object] | None,
+    current_report: dict[str, object] | None,
+    *,
+    limit: int,
+) -> list[str]:
+    delta = _finding_delta(previous_scan, current_report)
+    if not any(delta.values()):
+        return []
+    lines = [
+        (
+            "- Finding changes: "
+            f"{len(delta['new'])} new / {len(delta['resolved'])} resolved / "
+            f"{len(delta['persistent'])} persistent"
+        )
+    ]
+    examples = (
+        ("New finding", delta["new"]),
+        ("Resolved finding", delta["resolved"]),
+        ("Persistent finding", delta["persistent"]),
+    )
+    for label, findings in examples:
+        if findings:
+            lines.append(f"- {label}: {_finding_label(findings[0], limit=limit)}")
+    return lines
 
 
 def _previous_scan_summary(
@@ -921,6 +1044,13 @@ def _render_pr_comment(
             previous_scan,
             current_report,
             current_head_sha=head_sha,
+        )
+    )
+    current_scan_lines.extend(
+        _finding_delta_lines(
+            previous_scan,
+            current_report,
+            limit=finding_title_limit,
         )
     )
     links_line = (
