@@ -535,6 +535,56 @@ def _nonblank_string(value: object) -> str:
     return str(value or "").strip()
 
 
+def _mapping_or_empty(value: object) -> dict:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _dict_items(value: object) -> list[dict]:
+    return (
+        [item for item in value if isinstance(item, dict)]
+        if isinstance(value, list)
+        else []
+    )
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        return int(value.strip())
+    return default
+
+
+def _markdown_text(value: object) -> str:
+    text = _nonblank_string(value)
+    replacements = {
+        "<!--": "<\\!--",
+        "-->": "--\\>",
+        "\\": "\\\\",
+        "<": "\\<",
+        ">": "\\>",
+        "[": "\\[",
+        "]": "\\]",
+        "(": "\\(",
+        ")": "\\)",
+    }
+    for source, replacement in replacements.items():
+        text = text.replace(source, replacement)
+    return text
+
+
+def _comment_link(value: object) -> str:
+    link = _nonblank_string(value)
+    if not link:
+        return ""
+    parsed = parse.urlparse(link)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return link.replace(")", "%29")
+
+
 def _previous_scan_summary(
     previous_scan: dict[str, object] | None,
     current_report: dict[str, object] | None,
@@ -580,11 +630,15 @@ def _previous_scan_summary(
 
 def _finding_evidence_count(finding: dict, evidence_items: list[dict[str, object]]) -> int:
     evidence_refs = finding.get("evidence_refs")
+    evidence_ids = {
+        _nonblank_string(item.get("evidence_id")) or _nonblank_string(item.get("id"))
+        for item in evidence_items
+    }
+    evidence_ids.discard("")
     if isinstance(evidence_refs, list):
-        return len([item for item in evidence_refs if _nonblank_string(item)])
-    raw_count = finding.get("evidence_count")
-    if isinstance(raw_count, int) and not isinstance(raw_count, bool):
-        return raw_count
+        refs = {_nonblank_string(item) for item in evidence_refs}
+        refs.discard("")
+        return len(refs & evidence_ids) if evidence_ids else 0
     finding_id = _nonblank_string(finding.get("finding_id")) or _nonblank_string(
         finding.get("id")
     )
@@ -604,24 +658,19 @@ def _derive_evidence_law(
     report_findings = (
         current_report.get("findings") if isinstance(current_report, dict) else None
     )
-    findings = report_findings if isinstance(report_findings, list) else []
+    findings = _dict_items(report_findings)
     if not findings:
-        findings = list(json_payload.get("top_findings") or [])
+        findings = _dict_items(json_payload.get("top_findings"))
     evidence_items = (
         current_report.get("evidence_items")
         if isinstance(current_report, dict)
         else None
     )
-    evidence_rows = (
-        [item for item in evidence_items if isinstance(item, dict)]
-        if isinstance(evidence_items, list)
-        else []
-    )
+    evidence_rows = _dict_items(evidence_items)
     severe_findings = [
         finding
         for finding in findings
-        if isinstance(finding, dict)
-        and _nonblank_string(finding.get("severity")).lower() in {"high", "critical"}
+        if _nonblank_string(finding.get("severity")).lower() in {"high", "critical"}
     ]
     if not severe_findings:
         return (
@@ -636,7 +685,7 @@ def _derive_evidence_law(
     if unsupported_count:
         return (
             "Needs review",
-            f"{unsupported_count} high or critical finding(s) lack linked evidence.",
+            f"{unsupported_count} high or critical finding(s) lack verified linked evidence in this payload.",
         )
     return (
         "Satisfied",
@@ -651,9 +700,15 @@ def _evidence_law_summary(
     limit: int,
 ) -> str:
     derived_status, derived_detail = _derive_evidence_law(json_payload, current_report)
-    status = _nonblank_string(json_payload.get("evidence_law_status")) or derived_status
+    payload_status = _nonblank_string(json_payload.get("evidence_law_status"))
+    status = derived_status if derived_status == "Needs review" else payload_status or derived_status
+    detail_source = (
+        derived_detail
+        if derived_status == "Needs review"
+        else _nonblank_string(json_payload.get("evidence_law_detail")) or derived_detail
+    )
     detail = _shorten(
-        _nonblank_string(json_payload.get("evidence_law_detail")) or derived_detail,
+        _markdown_text(detail_source),
         limit,
     )
     return f"Evidence Law: {status} - {detail}"
@@ -668,10 +723,19 @@ def _pattern_match_summary(
     if not isinstance(matches, list) or not matches:
         return "Pattern matches: none returned."
 
+    valid_matches = [
+        raw_match
+        for raw_match in _dict_items(matches)
+        if (
+            _nonblank_string(raw_match.get("match_type"))
+            or raw_match.get("incident_id") is not None
+            or _nonblank_string(raw_match.get("public_pattern_id"))
+        )
+    ]
     labels: list[str] = []
-    for raw_match in matches[:2]:
-        if not isinstance(raw_match, dict):
-            continue
+    for raw_match in valid_matches:
+        if len(labels) >= 2:
+            break
         match_type = _nonblank_string(raw_match.get("match_type"))
         if match_type == "public_risk_pattern":
             match_label = (
@@ -689,7 +753,9 @@ def _pattern_match_summary(
         summary = _nonblank_string(raw_match.get("summary")) or _nonblank_string(
             raw_match.get("reason")
         )
-        suffix_parts = [part for part in (confidence, _shorten(summary, limit)) if part]
+        suffix_parts = [
+            part for part in (confidence, _shorten(_markdown_text(summary), limit)) if part
+        ]
         labels.append(
             match_label
             if not suffix_parts
@@ -698,7 +764,7 @@ def _pattern_match_summary(
 
     if not labels:
         return "Pattern matches: none returned."
-    extra = len(matches) - len(labels)
+    extra = max(len(valid_matches) - len(labels), 0)
     suffix = f"; +{extra} more" if extra > 0 else ""
     return "Pattern matches: " + "; ".join(labels) + suffix
 
@@ -752,16 +818,16 @@ def _uncertainty_summary(
         if isinstance(current_report, dict)
         else None
     )
-    uncertainty = (
-        _nonblank_string(context.get("uncertainty"))
-        if isinstance(context, dict)
-        else ""
-    )
+    uncertainty = _nonblank_string(context.get("uncertainty")) if isinstance(context, dict) else ""
     if not uncertainty:
-        uncertainty = _nonblank_string(json_payload.get("advisory_summary"))
+        flags = json_payload.get("uncertainty_flags")
+        if isinstance(flags, list) and flags:
+            uncertainty = "Flags: " + ", ".join(
+                _nonblank_string(flag) for flag in flags if _nonblank_string(flag)
+            )
     if not uncertainty:
-        uncertainty = "No additional uncertainty detail was returned."
-    return "Uncertainty: " + _shorten(uncertainty, limit)
+        uncertainty = "None reported."
+    return "Uncertainty: " + _shorten(_markdown_text(uncertainty), limit)
 
 
 def _render_pr_comment(
@@ -776,47 +842,49 @@ def _render_pr_comment(
     compact_links: bool = False,
     compact_context: bool = False,
 ) -> str:
-    json_payload = dict(share_summary.get("json_payload") or {})
+    share_summary = _mapping_or_empty(share_summary)
+    json_payload = _mapping_or_empty(share_summary.get("json_payload"))
     verdict_banner = _shorten(
-        str(json_payload.get("verdict_banner") or "DeployWhisper advisory"), 80
+        _markdown_text(json_payload.get("verdict_banner") or "DeployWhisper advisory"),
+        80,
     )
     headline = _shorten(
-        str(
+        _markdown_text(
             json_payload.get("headline")
             or share_summary.get("headline")
             or "DeployWhisper analysis completed."
         ),
         headline_limit,
     )
-    evidence_count = int(json_payload.get("evidence_count") or 0)
+    evidence_count = _safe_int(json_payload.get("evidence_count"))
     blast_radius_summary = _shorten(
-        str(json_payload.get("blast_radius_summary") or "No blast radius summary."),
+        _markdown_text(json_payload.get("blast_radius_summary") or "No blast radius summary."),
         summary_limit,
     )
     rollback_summary = _shorten(
-        str(json_payload.get("rollback_summary") or "Rollback summary unavailable."),
+        _markdown_text(json_payload.get("rollback_summary") or "Rollback summary unavailable."),
         summary_limit,
     )
     advisory_summary = _shorten(
-        str(
+        _markdown_text(
             json_payload.get("advisory_summary")
             or "This result requires additional human review before release."
         ),
         summary_limit,
     )
-    context = dict(json_payload.get("context_completeness") or {})
-    context_label = _shorten(str(context.get("label") or "UNKNOWN CONTEXT"), 32)
+    context = _mapping_or_empty(json_payload.get("context_completeness"))
+    context_label = _shorten(_markdown_text(context.get("label") or "UNKNOWN CONTEXT"), 32)
     context_summary = _shorten(
-        str(context.get("summary") or "Context completeness unavailable."),
+        _markdown_text(context.get("summary") or "Context completeness unavailable."),
         summary_limit,
     )
-    report_link = str(json_payload.get("report_link") or "").strip()
-    rollback_link = str(json_payload.get("rollback_link") or "").strip()
+    report_link = _comment_link(json_payload.get("report_link"))
+    rollback_link = _comment_link(json_payload.get("rollback_link"))
 
-    top_findings = list(json_payload.get("top_findings") or [])[:3]
+    top_findings = _dict_items(json_payload.get("top_findings"))[:3]
     current_scan_lines = []
     if current_report:
-        current_report_id = int(current_report.get("id") or 0)
+        current_report_id = _safe_int(current_report.get("id"))
         current_scan_lines.append(
             f"- Current analysis: report #{current_report_id} at "
             f"{_format_timestamp(str(current_report.get('created_at') or ''))}"
@@ -870,9 +938,9 @@ def _render_pr_comment(
     ]
     if top_findings:
         lines.extend(
-            f"- {str(finding.get('severity', 'medium')).upper()}: "
-            f"{_shorten(str(finding.get('title', 'Untitled finding')), finding_title_limit)} "
-            f"({int(finding.get('evidence_count') or 0)} evidence)"
+            f"- {_markdown_text(finding.get('severity') or 'medium').upper()}: "
+            f"{_shorten(_markdown_text(finding.get('title') or 'Untitled finding'), finding_title_limit)} "
+            f"({_safe_int(finding.get('evidence_count'))} evidence)"
             for finding in top_findings
         )
     else:

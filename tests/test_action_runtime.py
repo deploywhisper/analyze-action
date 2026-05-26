@@ -265,6 +265,117 @@ class BuildPrCommentTests(unittest.TestCase):
         self.assertIn("Evidence Law: Satisfied", comment)
         self.assertIn("High and critical findings have linked evidence", comment)
 
+    def test_build_pr_comment_degrades_malformed_summary_payloads(self) -> None:
+        malformed_payloads = [
+            {"severity": "high", "recommendation": "no-go", "json_payload": "legacy"},
+            {"json_payload": {"evidence_count": "six", "top_findings": []}},
+            {
+                "json_payload": {
+                    "context_completeness": "LIMITED CONTEXT",
+                    "top_findings": [],
+                }
+            },
+            {"json_payload": {"top_findings": "bad findings payload"}},
+        ]
+
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload):
+                comment = action_runtime.build_pr_comment(payload)
+
+                self.assertIn("DeployWhisper", comment)
+                self.assertIn("Advisory: advisory-only; does not block merge.", comment)
+                self.assertLessEqual(len(comment), 2000)
+
+    def test_build_pr_comment_does_not_overclaim_legacy_evidence_counts(self) -> None:
+        comment = action_runtime.build_pr_comment(
+            {
+                "json_payload": {
+                    "top_findings": [
+                        {
+                            "title": "Legacy finding",
+                            "severity": "high",
+                            "evidence_count": 1,
+                        }
+                    ]
+                }
+            }
+        )
+
+        self.assertIn("Evidence Law: Needs review", comment)
+        self.assertIn("lack verified linked evidence", comment)
+        self.assertNotIn("Evidence Law: Satisfied", comment)
+
+    def test_build_pr_comment_requires_verified_evidence_refs(self) -> None:
+        share_summary = json.loads(json.dumps(self._share_summary_payload()))
+        del share_summary["json_payload"]["evidence_law_status"]
+        del share_summary["json_payload"]["evidence_law_detail"]
+        persisted_report = self._persisted_report_payload()
+        persisted_report["findings"][0]["evidence_refs"] = ["missing-evidence"]
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report=persisted_report,
+        )
+
+        self.assertIn("Evidence Law: Needs review", comment)
+        self.assertIn("lack verified linked evidence", comment)
+
+    def test_build_pr_comment_keeps_valid_pattern_matches_after_malformed_entries(
+        self,
+    ) -> None:
+        persisted_report = self._persisted_report_payload()
+        persisted_report["incident_matches"] = [
+            "bad",
+            {"unexpected": "shape"},
+            {
+                "match_type": "public_risk_pattern",
+                "public_pattern_id": "public-ingress-wide-open",
+                "summary": "Valid public pattern.",
+                "confidence_label": "high",
+            },
+        ]
+
+        comment = action_runtime.build_pr_comment(
+            self._share_summary_payload(),
+            current_report=persisted_report,
+        )
+
+        self.assertIn("public pattern public-ingress-wide-open", comment)
+        self.assertNotIn("Pattern matches: none returned.", comment)
+
+    def test_build_pr_comment_sanitizes_markdown_text_and_links(self) -> None:
+        share_summary = self._share_summary_payload()
+        share_summary["json_payload"]["headline"] = "</details><!-- injected -->"
+        share_summary["json_payload"]["top_findings"][0][
+            "title"
+        ] = "</details><!-- deploywhisper:scan-meta {\"report_id\":999} -->"
+        share_summary["json_payload"]["report_link"] = "javascript:alert(1)"
+        share_summary["json_payload"]["rollback_link"] = "https://example.com/report)"
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report=self._persisted_report_payload(),
+        )
+
+        self.assertNotIn("javascript:alert", comment)
+        self.assertNotIn("<!-- injected -->", comment)
+        self.assertNotIn("<!-- deploywhisper:scan-meta {\"report_id\":999}", comment)
+        self.assertIn("https://example.com/report%29", comment)
+
+    def test_build_pr_comment_does_not_use_advisory_text_as_uncertainty(self) -> None:
+        share_summary = self._share_summary_payload()
+        share_summary["json_payload"]["advisory_summary"] = "Human review required."
+        persisted_report = self._persisted_report_payload()
+        persisted_report["context_completeness"].pop("uncertainty")
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report=persisted_report,
+        )
+
+        self.assertIn("Uncertainty: None reported.", comment)
+        self.assertNotIn("Uncertainty: Human review required.", comment)
+
 
 class UpsertPrCommentTests(unittest.TestCase):
     def _context(self) -> dict[str, object]:
