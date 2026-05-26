@@ -483,7 +483,19 @@ def extract_comment_metadata(comment_body: str) -> dict[str, object] | None:
         payload = json.loads(match.group(1))
     except json.JSONDecodeError:
         return None
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return {
+            "report_id": int(payload.get("report_id") or 0),
+            "risk_score": int(payload.get("risk_score") or 0),
+            "severity": str(payload.get("severity") or "").lower(),
+            "recommendation": str(payload.get("recommendation") or "").lower(),
+            "created_at": str(payload.get("created_at") or ""),
+            "head_sha": str(payload.get("head_sha") or "")[:12],
+        }
+    except (TypeError, ValueError):
+        return None
 
 
 def _current_scan_meta(
@@ -500,10 +512,17 @@ def _current_scan_meta(
 
 
 def _previous_scan_summary(
-    previous_scan: dict[str, object] | None, current_report: dict[str, object] | None
+    previous_scan: dict[str, object] | None,
+    current_report: dict[str, object] | None,
+    *,
+    current_head_sha: str | None = None,
 ) -> list[str]:
     if not previous_scan or not current_report:
         return []
+    previous_head_sha = str(previous_scan.get("head_sha") or "")
+    current_head_sha = (current_head_sha or "")[:12]
+    if previous_head_sha and current_head_sha and previous_head_sha == current_head_sha:
+        return ["- Change since last scan: rerun of the same commit."]
     previous_score = int(previous_scan.get("risk_score") or 0)
     current_score = int(current_report.get("risk_score") or 0)
     previous_severity = str(previous_scan.get("severity") or "unknown").upper()
@@ -579,7 +598,13 @@ def _render_pr_comment(
             f"- Current analysis: report #{current_report_id} at "
             f"{_format_timestamp(str(current_report.get('created_at') or ''))}"
         )
-    current_scan_lines.extend(_previous_scan_summary(previous_scan, current_report))
+    current_scan_lines.extend(
+        _previous_scan_summary(
+            previous_scan,
+            current_report,
+            current_head_sha=head_sha,
+        )
+    )
     links_line = (
         f"- Links: [Report]({report_link}) · [Rollback]({rollback_link})"
         if compact_links and report_link and rollback_link

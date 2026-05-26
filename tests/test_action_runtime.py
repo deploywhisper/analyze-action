@@ -156,6 +156,34 @@ class BuildPrCommentTests(unittest.TestCase):
         self.assertIn("Previous analysis: report #41", comment)
         self.assertIn("Current analysis: report #42", comment)
 
+    def test_build_pr_comment_suppresses_delta_for_same_commit_rerun(self) -> None:
+        share_summary = self._share_summary_payload()
+        current_report = {
+            "id": 42,
+            "risk_score": 34,
+            "severity": "low",
+            "recommendation": "go",
+            "created_at": "2026-04-23T10:05:00+00:00",
+        }
+        previous_scan = {
+            "report_id": 41,
+            "risk_score": 78,
+            "severity": "high",
+            "recommendation": "no-go",
+            "created_at": "2026-04-23T09:55:00+00:00",
+            "head_sha": "abcdef123456",
+        }
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report=current_report,
+            previous_scan=previous_scan,
+            head_sha="abcdef1234567890",
+        )
+
+        self.assertIn("rerun of the same commit", comment)
+        self.assertNotIn("Risk score changed", comment)
+
 
 class UpsertPrCommentTests(unittest.TestCase):
     def _context(self) -> dict[str, object]:
@@ -302,6 +330,19 @@ class UpsertPrCommentTests(unittest.TestCase):
         self.assertEqual(metadata["risk_score"], 78)
         self.assertEqual(metadata["severity"], "high")
         self.assertEqual(metadata["head_sha"], "abcdef123456")
+
+    def test_extract_comment_metadata_ignores_malformed_scan_marker(self) -> None:
+        body = "\n".join(
+            [
+                "<!-- deploywhisper:pr-comment -->",
+                '<!-- deploywhisper:scan-meta {"report_id":"bad","risk_score":"bad"} -->',
+                "existing body",
+            ]
+        )
+
+        metadata = action_runtime.extract_comment_metadata(body)
+
+        self.assertIsNone(metadata)
 
 
 class SubmitAnalysisTests(unittest.TestCase):
@@ -525,7 +566,7 @@ class RunActionCommentTests(unittest.TestCase):
                 "event_name": "pull_request",
                 "repository": "deploywhisper/example-repo",
                 "pull_request_number": 17,
-                "head_sha": "abcdef1234567890",
+                "head_sha": "fedcba6543217890",
             }
 
             with (
@@ -708,6 +749,107 @@ class RunActionCommentTests(unittest.TestCase):
             self.assertIn("severity=medium", output)
             self.assertIn("recommendation=review", output)
 
+    def test_run_action_rejects_missing_project_scope_when_string_false(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            args = argparse.Namespace(
+                api_url="https://deploywhisper.example.com",
+                api_token="",
+                project_key="",
+                project_id="",
+                workspace_key="",
+                workspace_id="",
+                allow_derived_project_scope="false",
+                changed_files="plan.tf",
+                working_directory=str(repo_root),
+            )
+            context = {
+                "event_name": "workflow_dispatch",
+                "repository": "deploywhisper/action-smoke-consumer",
+                "sha": "abcdef1234567890",
+            }
+
+            with (
+                patch(
+                    "action_runtime.select_artifacts_for_upload",
+                    return_value=([("plan.tf", b"resource")], []),
+                ),
+                patch("action_runtime.submit_analysis") as submit_analysis,
+                patch(
+                    "action_runtime.load_github_context",
+                    return_value=context,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    action_runtime.ActionRuntimeError,
+                    "Project scope is required",
+                ):
+                    action_runtime.run_action(args, environ={})
+
+            submit_analysis.assert_not_called()
+
+    def test_run_action_allows_missing_project_scope_when_string_true(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            output_path = repo_root / "github-output.txt"
+            summary_path = repo_root / "step-summary.md"
+            args = argparse.Namespace(
+                api_url="https://deploywhisper.example.com",
+                api_token="",
+                project_key="",
+                project_id="",
+                workspace_key="",
+                workspace_id="",
+                allow_derived_project_scope="true",
+                changed_files="plan.tf",
+                working_directory=str(repo_root),
+            )
+            context = {
+                "event_name": "workflow_dispatch",
+                "repository": "deploywhisper/action-smoke-consumer",
+                "sha": "abcdef1234567890",
+            }
+            analysis_payload = {
+                "meta": {"accepted_artifact_count": 1},
+                "data": {
+                    "persisted_report": {"id": 42},
+                    "share_summary": {
+                        "severity": "low",
+                        "recommendation": "go",
+                        "markdown": "### DeployWhisper LOW · GO",
+                        "json_payload": {
+                            "report_link": "https://deploywhisper.example.com/history?report_id=42",
+                        },
+                    },
+                },
+            }
+
+            with (
+                patch(
+                    "action_runtime.select_artifacts_for_upload",
+                    return_value=([("plan.tf", b"resource")], []),
+                ),
+                patch(
+                    "action_runtime.submit_analysis",
+                    return_value=analysis_payload,
+                ) as submit_analysis,
+                patch(
+                    "action_runtime.load_github_context",
+                    return_value=context,
+                ),
+            ):
+                exit_code = action_runtime.run_action(
+                    args,
+                    environ={
+                        "GITHUB_OUTPUT": str(output_path),
+                        "GITHUB_STEP_SUMMARY": str(summary_path),
+                    },
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertIsNone(submit_analysis.call_args.kwargs["project_key"])
+            self.assertIsNone(submit_analysis.call_args.kwargs["project_id"])
+
     def test_run_action_keeps_report_successful_when_comment_publish_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
@@ -754,7 +896,7 @@ class RunActionCommentTests(unittest.TestCase):
                 "event_name": "pull_request",
                 "repository": "deploywhisper/example-repo",
                 "pull_request_number": 17,
-                "head_sha": "abcdef1234567890",
+                "head_sha": "fedcba6543217890",
             }
             environ = {
                 "GITHUB_OUTPUT": str(output_path),
@@ -853,7 +995,7 @@ class RunActionCommentTests(unittest.TestCase):
                 "event_name": "pull_request",
                 "repository": "deploywhisper/example-repo",
                 "pull_request_number": 17,
-                "head_sha": "abcdef1234567890",
+                "head_sha": "fedcba6543217890",
             }
             existing_comment = {
                 "id": 777,
