@@ -346,21 +346,56 @@ class BuildPrCommentTests(unittest.TestCase):
     def test_build_pr_comment_sanitizes_markdown_text_and_links(self) -> None:
         share_summary = self._share_summary_payload()
         share_summary["json_payload"]["headline"] = "</details><!-- injected -->"
+        share_summary["json_payload"][
+            "evidence_law_status"
+        ] = "Satisfied\n### injected status"
         share_summary["json_payload"]["top_findings"][0][
             "title"
         ] = "</details><!-- deploywhisper:scan-meta {\"report_id\":999} -->"
         share_summary["json_payload"]["report_link"] = "javascript:alert(1)"
-        share_summary["json_payload"]["rollback_link"] = "https://example.com/report)"
+        share_summary["json_payload"][
+            "rollback_link"
+        ] = "https://example.com/report)\n- injected"
+        persisted_report = self._persisted_report_payload()
+        persisted_report["incident_matches"][0][
+            "public_pattern_id"
+        ] = "pattern\n### injected pattern"
+        persisted_report["incident_matches"][0]["confidence_label"] = "high\n- injected"
+        persisted_report["parse_batch"]["files"][0][
+            "tool"
+        ] = "terraform\n### injected scanner"
 
         comment = action_runtime.build_pr_comment(
             share_summary,
-            current_report=self._persisted_report_payload(),
+            current_report=persisted_report,
         )
 
         self.assertNotIn("javascript:alert", comment)
         self.assertNotIn("<!-- injected -->", comment)
         self.assertNotIn("<!-- deploywhisper:scan-meta {\"report_id\":999}", comment)
-        self.assertIn("https://example.com/report%29", comment)
+        self.assertNotIn("### injected status", comment)
+        self.assertNotIn("### injected pattern", comment)
+        self.assertNotIn("### injected scanner", comment)
+        self.assertNotIn("\n- injected", comment)
+        self.assertNotIn("https://example.com/report", comment)
+
+    def test_build_pr_comment_ignores_non_finite_parser_success_rates(self) -> None:
+        persisted_report = self._persisted_report_payload()
+        persisted_report["parse_batch"] = {}
+        persisted_report["context_completeness"]["parser_success_by_tool"] = {
+            "terraform": 1.0,
+            "kubernetes": float("nan"),
+            "ansible": float("inf"),
+        }
+
+        comment = action_runtime.build_pr_comment(
+            self._share_summary_payload(),
+            current_report=persisted_report,
+        )
+
+        self.assertIn("Scanner context: terraform 100% parser success", comment)
+        self.assertNotIn("kubernetes", comment)
+        self.assertNotIn("ansible", comment)
 
     def test_build_pr_comment_does_not_use_advisory_text_as_uncertainty(self) -> None:
         share_summary = self._share_summary_payload()
@@ -874,6 +909,79 @@ class RunActionCommentTests(unittest.TestCase):
                 "comment-url=https://github.com/deploywhisper/example-repo/issues/17#issuecomment-777",
                 output,
             )
+
+    def test_run_action_degrades_malformed_api_response_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            output_path = repo_root / "github-output.txt"
+            summary_path = repo_root / "step-summary.md"
+            args = argparse.Namespace(
+                api_url="https://deploywhisper.example.com",
+                api_token="",
+                project_key="payments",
+                project_id="",
+                workspace_key="",
+                workspace_id="",
+                changed_files="plan.tf",
+                working_directory=str(repo_root),
+            )
+            analysis_payload = {
+                "meta": "legacy meta",
+                "data": {
+                    "persisted_report": "legacy report",
+                    "advisory": "legacy advisory",
+                    "share_summary": "legacy summary",
+                },
+            }
+            environ = {
+                "GITHUB_OUTPUT": str(output_path),
+                "GITHUB_STEP_SUMMARY": str(summary_path),
+                "GITHUB_TOKEN": "ghs_test",
+            }
+            context = {
+                "event_name": "pull_request",
+                "repository": "deploywhisper/example-repo",
+                "pull_request_number": 17,
+                "head_sha": "fedcba6543217890",
+            }
+
+            with (
+                patch(
+                    "action_runtime.select_artifacts_for_upload",
+                    return_value=([("plan.tf", b"resource")], []),
+                ),
+                patch(
+                    "action_runtime.submit_analysis",
+                    return_value=analysis_payload,
+                ),
+                patch(
+                    "action_runtime.load_github_context",
+                    return_value=context,
+                ),
+                patch(
+                    "action_runtime.find_existing_pr_comment",
+                    return_value=None,
+                ),
+                patch(
+                    "action_runtime.upsert_pr_comment",
+                    return_value={
+                        "id": 778,
+                        "html_url": "https://github.com/deploywhisper/example-repo/issues/17#issuecomment-778",
+                        "updated": False,
+                    },
+                ) as upsert_pr_comment,
+            ):
+                exit_code = action_runtime.run_action(args, environ=environ)
+
+            self.assertEqual(exit_code, 0)
+            output = output_path.read_text(encoding="utf-8")
+            summary = summary_path.read_text(encoding="utf-8")
+            self.assertIn("created=true", output)
+            self.assertIn("comment-id=778", output)
+            self.assertIn("Report ID: unavailable", summary)
+            comment_body = upsert_pr_comment.call_args.args[1]
+            self.assertIn("DeployWhisper advisory", comment_body)
+            self.assertIn("Advisory: advisory-only; does not block merge.", comment_body)
 
     def test_run_action_uses_workflow_dispatch_trigger_for_manual_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

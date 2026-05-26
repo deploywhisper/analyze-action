@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from datetime import UTC, datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -522,8 +523,8 @@ def _current_scan_meta(
     current_report: dict[str, object], *, head_sha: str | None
 ) -> dict[str, object]:
     return {
-        "report_id": int(current_report.get("id") or 0),
-        "risk_score": int(current_report.get("risk_score") or 0),
+        "report_id": _safe_int(current_report.get("id")),
+        "risk_score": _safe_int(current_report.get("risk_score")),
         "severity": str(current_report.get("severity") or "").lower(),
         "recommendation": str(current_report.get("recommendation") or "").lower(),
         "created_at": str(current_report.get("created_at") or ""),
@@ -533,6 +534,10 @@ def _current_scan_meta(
 
 def _nonblank_string(value: object) -> str:
     return str(value or "").strip()
+
+
+def _single_line_string(value: object) -> str:
+    return " ".join(_nonblank_string(value).split())
 
 
 def _mapping_or_empty(value: object) -> dict:
@@ -558,7 +563,7 @@ def _safe_int(value: object, default: int = 0) -> int:
 
 
 def _markdown_text(value: object) -> str:
-    text = _nonblank_string(value)
+    text = _single_line_string(value)
     replacements = {
         "<!--": "<\\!--",
         "-->": "--\\>",
@@ -569,6 +574,12 @@ def _markdown_text(value: object) -> str:
         "]": "\\]",
         "(": "\\(",
         ")": "\\)",
+        "#": "\\#",
+        "*": "\\*",
+        "_": "\\_",
+        "`": "\\`",
+        "|": "\\|",
+        "!": "\\!",
     }
     for source, replacement in replacements.items():
         text = text.replace(source, replacement)
@@ -579,10 +590,19 @@ def _comment_link(value: object) -> str:
     link = _nonblank_string(value)
     if not link:
         return ""
+    if any(character.isspace() or character in '<>"' for character in link):
+        return ""
     parsed = parse.urlparse(link)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return ""
-    return link.replace(")", "%29")
+    return link.replace("(", "%28").replace(")", "%29")
+
+
+def _finite_rate(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    rate = float(value)
+    return rate if math.isfinite(rate) else None
 
 
 def _previous_scan_summary(
@@ -605,11 +625,11 @@ def _previous_scan_summary(
             )
         )
     )
-    previous_score = int(previous_scan.get("risk_score") or 0)
-    current_score = int(current_report.get("risk_score") or 0)
+    previous_score = _safe_int(previous_scan.get("risk_score"))
+    current_score = _safe_int(current_report.get("risk_score"))
     previous_severity = str(previous_scan.get("severity") or "unknown").upper()
     current_severity = str(current_report.get("severity") or "unknown").upper()
-    previous_report_id = int(previous_scan.get("report_id") or 0)
+    previous_report_id = _safe_int(previous_scan.get("report_id"))
     lines = [
         (
             f"- Change since last scan: Risk score changed {previous_score} → {current_score}, "
@@ -701,7 +721,10 @@ def _evidence_law_summary(
 ) -> str:
     derived_status, derived_detail = _derive_evidence_law(json_payload, current_report)
     payload_status = _nonblank_string(json_payload.get("evidence_law_status"))
-    status = derived_status if derived_status == "Needs review" else payload_status or derived_status
+    status_source = (
+        derived_status if derived_status == "Needs review" else payload_status or derived_status
+    )
+    status = _shorten(_markdown_text(status_source), 48)
     detail_source = (
         derived_detail
         if derived_status == "Needs review"
@@ -736,20 +759,22 @@ def _pattern_match_summary(
     for raw_match in valid_matches:
         if len(labels) >= 2:
             break
-        match_type = _nonblank_string(raw_match.get("match_type"))
+        match_type = _single_line_string(raw_match.get("match_type"))
         if match_type == "public_risk_pattern":
             match_label = (
                 "public pattern "
                 + (
-                    _nonblank_string(raw_match.get("public_pattern_id"))
+                    _markdown_text(raw_match.get("public_pattern_id"))
                     or "unidentified"
                 )
             )
         elif raw_match.get("incident_id") is not None:
-            match_label = f"organization incident #{raw_match.get('incident_id')}"
+            match_label = "organization incident #" + _markdown_text(
+                raw_match.get("incident_id")
+            )
         else:
-            match_label = match_type.replace("_", " ") or "matched pattern"
-        confidence = _nonblank_string(raw_match.get("confidence_label"))
+            match_label = _markdown_text(match_type.replace("_", " ")) or "matched pattern"
+        confidence = _markdown_text(raw_match.get("confidence_label"))
         summary = _nonblank_string(raw_match.get("summary")) or _nonblank_string(
             raw_match.get("reason")
         )
@@ -782,7 +807,7 @@ def _scanner_context_summary(current_report: dict[str, object] | None) -> str:
             for raw_file in files:
                 if not isinstance(raw_file, dict):
                     continue
-                tool = _nonblank_string(raw_file.get("tool")) or "unknown"
+                tool = _markdown_text(raw_file.get("tool")) or "unknown"
                 totals[tool] = totals.get(tool, 0) + 1
                 if _nonblank_string(raw_file.get("status")).lower() == "parsed":
                     parsed[tool] = parsed.get(tool, 0) + 1
@@ -796,11 +821,13 @@ def _scanner_context_summary(current_report: dict[str, object] | None) -> str:
     if isinstance(context, dict):
         parser_success = context.get("parser_success_by_tool")
         if isinstance(parser_success, dict) and parser_success:
-            parts = [
-                f"{tool} {round(float(rate) * 100)}% parser success"
-                for tool, rate in sorted(parser_success.items())
-                if isinstance(rate, (int, float)) and not isinstance(rate, bool)
-            ]
+            parts = []
+            for tool, rate in sorted(parser_success.items()):
+                finite_rate = _finite_rate(rate)
+                if finite_rate is not None:
+                    parts.append(
+                        f"{_markdown_text(tool)} {round(finite_rate * 100)}% parser success"
+                    )
             if parts:
                 return "Scanner context: " + "; ".join(parts)
 
@@ -1162,11 +1189,13 @@ def _success_summary(
     uploaded_files: list[tuple[str, bytes]],
     skipped_files: list[str],
 ) -> str:
-    data = dict(analysis_payload.get("data") or {})
-    share_summary = dict(data.get("share_summary") or {})
-    persisted_report = dict(data.get("persisted_report") or {})
+    analysis_payload = _mapping_or_empty(analysis_payload)
+    data = _mapping_or_empty(analysis_payload.get("data"))
+    share_summary = _mapping_or_empty(data.get("share_summary"))
+    share_json = _mapping_or_empty(share_summary.get("json_payload"))
+    persisted_report = _mapping_or_empty(data.get("persisted_report"))
     report_id = persisted_report.get("id")
-    report_link = (share_summary.get("json_payload") or {}).get("report_link")
+    report_link = _comment_link(share_json.get("report_link"))
 
     lines = [
         "## DeployWhisper analysis submitted",
@@ -1179,7 +1208,7 @@ def _success_summary(
     if skipped_files:
         lines.append("- Skipped files:")
         lines.extend(f"  - {item}" for item in skipped_files)
-    markdown = str(share_summary.get("markdown") or "").strip()
+    markdown = _nonblank_string(share_summary.get("markdown"))
     if markdown:
         lines.extend(["", markdown])
     return "\n".join(lines)
@@ -1338,12 +1367,13 @@ def run_action(args: argparse.Namespace, environ: dict[str, str] | None = None) 
         trigger_id=_build_trigger_id(context),
     )
 
-    data = dict(payload.get("data") or {})
-    meta = dict(payload.get("meta") or {})
-    advisory = dict(data.get("advisory") or {})
-    share_summary = dict(data.get("share_summary") or {})
-    share_json = dict(share_summary.get("json_payload") or {})
-    persisted_report = dict(data.get("persisted_report") or {})
+    payload = _mapping_or_empty(payload)
+    data = _mapping_or_empty(payload.get("data"))
+    meta = _mapping_or_empty(payload.get("meta"))
+    advisory = _mapping_or_empty(data.get("advisory"))
+    share_summary = _mapping_or_empty(data.get("share_summary"))
+    share_json = _mapping_or_empty(share_summary.get("json_payload"))
+    persisted_report = _mapping_or_empty(data.get("persisted_report"))
 
     write_github_output("created", "true", env)
     write_github_output(
