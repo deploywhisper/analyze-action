@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from datetime import UTC, datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -522,8 +523,8 @@ def _current_scan_meta(
     current_report: dict[str, object], *, head_sha: str | None
 ) -> dict[str, object]:
     return {
-        "report_id": int(current_report.get("id") or 0),
-        "risk_score": int(current_report.get("risk_score") or 0),
+        "report_id": _safe_int(current_report.get("id")),
+        "risk_score": _safe_int(current_report.get("risk_score")),
         "severity": str(current_report.get("severity") or "").lower(),
         "recommendation": str(current_report.get("recommendation") or "").lower(),
         "created_at": str(current_report.get("created_at") or ""),
@@ -533,6 +534,75 @@ def _current_scan_meta(
 
 def _nonblank_string(value: object) -> str:
     return str(value or "").strip()
+
+
+def _single_line_string(value: object) -> str:
+    return " ".join(_nonblank_string(value).split())
+
+
+def _mapping_or_empty(value: object) -> dict:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _dict_items(value: object) -> list[dict]:
+    return (
+        [item for item in value if isinstance(item, dict)]
+        if isinstance(value, list)
+        else []
+    )
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        return int(value.strip())
+    return default
+
+
+def _markdown_text(value: object) -> str:
+    text = _single_line_string(value)
+    replacements = {
+        "<!--": "<\\!--",
+        "-->": "--\\>",
+        "\\": "\\\\",
+        "<": "\\<",
+        ">": "\\>",
+        "[": "\\[",
+        "]": "\\]",
+        "(": "\\(",
+        ")": "\\)",
+        "#": "\\#",
+        "*": "\\*",
+        "_": "\\_",
+        "`": "\\`",
+        "|": "\\|",
+        "!": "\\!",
+    }
+    for source, replacement in replacements.items():
+        text = text.replace(source, replacement)
+    return text
+
+
+def _comment_link(value: object) -> str:
+    link = _nonblank_string(value)
+    if not link:
+        return ""
+    if any(character.isspace() or character in '<>"' for character in link):
+        return ""
+    parsed = parse.urlparse(link)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return link.replace("(", "%28").replace(")", "%29")
+
+
+def _finite_rate(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    rate = float(value)
+    return rate if math.isfinite(rate) else None
 
 
 def _previous_scan_summary(
@@ -555,11 +625,11 @@ def _previous_scan_summary(
             )
         )
     )
-    previous_score = int(previous_scan.get("risk_score") or 0)
-    current_score = int(current_report.get("risk_score") or 0)
+    previous_score = _safe_int(previous_scan.get("risk_score"))
+    current_score = _safe_int(current_report.get("risk_score"))
     previous_severity = str(previous_scan.get("severity") or "unknown").upper()
     current_severity = str(current_report.get("severity") or "unknown").upper()
-    previous_report_id = int(previous_scan.get("report_id") or 0)
+    previous_report_id = _safe_int(previous_scan.get("report_id"))
     lines = [
         (
             f"- Change since last scan: Risk score changed {previous_score} → {current_score}, "
@@ -578,6 +648,215 @@ def _previous_scan_summary(
     return lines
 
 
+def _finding_evidence_count(finding: dict, evidence_items: list[dict[str, object]]) -> int:
+    evidence_refs = finding.get("evidence_refs")
+    evidence_ids = {
+        _nonblank_string(item.get("evidence_id")) or _nonblank_string(item.get("id"))
+        for item in evidence_items
+    }
+    evidence_ids.discard("")
+    if isinstance(evidence_refs, list):
+        refs = {_nonblank_string(item) for item in evidence_refs}
+        refs.discard("")
+        return len(refs & evidence_ids) if evidence_ids else 0
+    finding_id = _nonblank_string(finding.get("finding_id")) or _nonblank_string(
+        finding.get("id")
+    )
+    if not finding_id:
+        return 0
+    return sum(
+        1
+        for evidence_item in evidence_items
+        if _nonblank_string(evidence_item.get("finding_id")) == finding_id
+    )
+
+
+def _derive_evidence_law(
+    json_payload: dict,
+    current_report: dict[str, object] | None,
+) -> tuple[str, str]:
+    report_findings = (
+        current_report.get("findings") if isinstance(current_report, dict) else None
+    )
+    findings = _dict_items(report_findings)
+    if not findings:
+        findings = _dict_items(json_payload.get("top_findings"))
+    evidence_items = (
+        current_report.get("evidence_items")
+        if isinstance(current_report, dict)
+        else None
+    )
+    evidence_rows = _dict_items(evidence_items)
+    severe_findings = [
+        finding
+        for finding in findings
+        if _nonblank_string(finding.get("severity")).lower() in {"high", "critical"}
+    ]
+    if not severe_findings:
+        return (
+            "Satisfied",
+            "No high or critical findings require Evidence Law support.",
+        )
+    unsupported_count = sum(
+        1
+        for finding in severe_findings
+        if _finding_evidence_count(finding, evidence_rows) <= 0
+    )
+    if unsupported_count:
+        return (
+            "Needs review",
+            f"{unsupported_count} high or critical finding(s) lack verified linked evidence in this payload.",
+        )
+    return (
+        "Satisfied",
+        "High and critical findings have linked evidence in this report.",
+    )
+
+
+def _evidence_law_summary(
+    json_payload: dict,
+    current_report: dict[str, object] | None,
+    *,
+    limit: int,
+) -> str:
+    derived_status, derived_detail = _derive_evidence_law(json_payload, current_report)
+    payload_status = _nonblank_string(json_payload.get("evidence_law_status"))
+    status_source = (
+        derived_status if derived_status == "Needs review" else payload_status or derived_status
+    )
+    status = _shorten(_markdown_text(status_source), 48)
+    detail_source = (
+        derived_detail
+        if derived_status == "Needs review"
+        else _nonblank_string(json_payload.get("evidence_law_detail")) or derived_detail
+    )
+    detail = _shorten(
+        _markdown_text(detail_source),
+        limit,
+    )
+    return f"Evidence Law: {status} - {detail}"
+
+
+def _pattern_match_summary(
+    current_report: dict[str, object] | None, *, limit: int
+) -> str:
+    if not current_report:
+        return "Pattern matches: not available in this action response."
+    matches = current_report.get("incident_matches")
+    if not isinstance(matches, list) or not matches:
+        return "Pattern matches: none returned."
+
+    valid_matches = [
+        raw_match
+        for raw_match in _dict_items(matches)
+        if (
+            _nonblank_string(raw_match.get("match_type"))
+            or raw_match.get("incident_id") is not None
+            or _nonblank_string(raw_match.get("public_pattern_id"))
+        )
+    ]
+    labels: list[str] = []
+    for raw_match in valid_matches:
+        if len(labels) >= 2:
+            break
+        match_type = _single_line_string(raw_match.get("match_type"))
+        if match_type == "public_risk_pattern":
+            match_label = (
+                "public pattern "
+                + (
+                    _markdown_text(raw_match.get("public_pattern_id"))
+                    or "unidentified"
+                )
+            )
+        elif raw_match.get("incident_id") is not None:
+            match_label = "organization incident #" + _markdown_text(
+                raw_match.get("incident_id")
+            )
+        else:
+            match_label = _markdown_text(match_type.replace("_", " ")) or "matched pattern"
+        confidence = _markdown_text(raw_match.get("confidence_label"))
+        summary = _nonblank_string(raw_match.get("summary")) or _nonblank_string(
+            raw_match.get("reason")
+        )
+        suffix_parts = [
+            part for part in (confidence, _shorten(_markdown_text(summary), limit)) if part
+        ]
+        labels.append(
+            match_label
+            if not suffix_parts
+            else f"{match_label} ({'; '.join(suffix_parts)})"
+        )
+
+    if not labels:
+        return "Pattern matches: none returned."
+    extra = max(len(valid_matches) - len(labels), 0)
+    suffix = f"; +{extra} more" if extra > 0 else ""
+    return "Pattern matches: " + "; ".join(labels) + suffix
+
+
+def _scanner_context_summary(current_report: dict[str, object] | None) -> str:
+    if not current_report:
+        return "Scanner context: not available in this action response."
+
+    parse_batch = current_report.get("parse_batch")
+    if isinstance(parse_batch, dict):
+        files = parse_batch.get("files")
+        if isinstance(files, list) and files:
+            totals: dict[str, int] = {}
+            parsed: dict[str, int] = {}
+            for raw_file in files:
+                if not isinstance(raw_file, dict):
+                    continue
+                tool = _markdown_text(raw_file.get("tool")) or "unknown"
+                totals[tool] = totals.get(tool, 0) + 1
+                if _nonblank_string(raw_file.get("status")).lower() == "parsed":
+                    parsed[tool] = parsed.get(tool, 0) + 1
+            if totals:
+                return "Scanner context: " + "; ".join(
+                    f"{tool} {parsed.get(tool, 0)}/{total} parsed"
+                    for tool, total in totals.items()
+                )
+
+    context = current_report.get("context_completeness")
+    if isinstance(context, dict):
+        parser_success = context.get("parser_success_by_tool")
+        if isinstance(parser_success, dict) and parser_success:
+            parts = []
+            for tool, rate in sorted(parser_success.items()):
+                finite_rate = _finite_rate(rate)
+                if finite_rate is not None:
+                    parts.append(
+                        f"{_markdown_text(tool)} {round(finite_rate * 100)}% parser success"
+                    )
+            if parts:
+                return "Scanner context: " + "; ".join(parts)
+
+    return "Scanner context: unavailable."
+
+
+def _uncertainty_summary(
+    json_payload: dict,
+    current_report: dict[str, object] | None,
+    *,
+    limit: int,
+) -> str:
+    context = (
+        current_report.get("context_completeness")
+        if isinstance(current_report, dict)
+        else None
+    )
+    uncertainty = _nonblank_string(context.get("uncertainty")) if isinstance(context, dict) else ""
+    if not uncertainty:
+        flags = json_payload.get("uncertainty_flags")
+        if isinstance(flags, list) and flags:
+            uncertainty = "Flags: " + ", ".join(
+                _nonblank_string(flag) for flag in flags if _nonblank_string(flag)
+            )
+    if not uncertainty:
+        uncertainty = "None reported."
+    return "Uncertainty: " + _shorten(_markdown_text(uncertainty), limit)
+
+
 def _render_pr_comment(
     share_summary: dict,
     *,
@@ -590,47 +869,49 @@ def _render_pr_comment(
     compact_links: bool = False,
     compact_context: bool = False,
 ) -> str:
-    json_payload = dict(share_summary.get("json_payload") or {})
+    share_summary = _mapping_or_empty(share_summary)
+    json_payload = _mapping_or_empty(share_summary.get("json_payload"))
     verdict_banner = _shorten(
-        str(json_payload.get("verdict_banner") or "DeployWhisper advisory"), 80
+        _markdown_text(json_payload.get("verdict_banner") or "DeployWhisper advisory"),
+        80,
     )
     headline = _shorten(
-        str(
+        _markdown_text(
             json_payload.get("headline")
             or share_summary.get("headline")
             or "DeployWhisper analysis completed."
         ),
         headline_limit,
     )
-    evidence_count = int(json_payload.get("evidence_count") or 0)
+    evidence_count = _safe_int(json_payload.get("evidence_count"))
     blast_radius_summary = _shorten(
-        str(json_payload.get("blast_radius_summary") or "No blast radius summary."),
+        _markdown_text(json_payload.get("blast_radius_summary") or "No blast radius summary."),
         summary_limit,
     )
     rollback_summary = _shorten(
-        str(json_payload.get("rollback_summary") or "Rollback summary unavailable."),
+        _markdown_text(json_payload.get("rollback_summary") or "Rollback summary unavailable."),
         summary_limit,
     )
     advisory_summary = _shorten(
-        str(
+        _markdown_text(
             json_payload.get("advisory_summary")
             or "This result requires additional human review before release."
         ),
         summary_limit,
     )
-    context = dict(json_payload.get("context_completeness") or {})
-    context_label = _shorten(str(context.get("label") or "UNKNOWN CONTEXT"), 32)
+    context = _mapping_or_empty(json_payload.get("context_completeness"))
+    context_label = _shorten(_markdown_text(context.get("label") or "UNKNOWN CONTEXT"), 32)
     context_summary = _shorten(
-        str(context.get("summary") or "Context completeness unavailable."),
+        _markdown_text(context.get("summary") or "Context completeness unavailable."),
         summary_limit,
     )
-    report_link = str(json_payload.get("report_link") or "").strip()
-    rollback_link = str(json_payload.get("rollback_link") or "").strip()
+    report_link = _comment_link(json_payload.get("report_link"))
+    rollback_link = _comment_link(json_payload.get("rollback_link"))
 
-    top_findings = list(json_payload.get("top_findings") or [])[:3]
+    top_findings = _dict_items(json_payload.get("top_findings"))[:3]
     current_scan_lines = []
     if current_report:
-        current_report_id = int(current_report.get("id") or 0)
+        current_report_id = _safe_int(current_report.get("id"))
         current_scan_lines.append(
             f"- Current analysis: report #{current_report_id} at "
             f"{_format_timestamp(str(current_report.get('created_at') or ''))}"
@@ -664,7 +945,13 @@ def _render_pr_comment(
         f"## {verdict_banner}",
         f"**Summary:** {headline}",
         f"- Evidence: {evidence_count} evidence items",
+        f"- {_evidence_law_summary(json_payload, current_report, limit=summary_limit)}",
         f"- Blast radius: {blast_radius_summary}",
+        f"- Rollback: {rollback_summary}",
+        f"- {_pattern_match_summary(current_report, limit=summary_limit)}",
+        f"- {_scanner_context_summary(current_report)}",
+        f"- {_uncertainty_summary(json_payload, current_report, limit=summary_limit)}",
+        "- Advisory: advisory-only; does not block merge.",
         links_line,
         (
             f"- Context: {context_label}"
@@ -673,14 +960,14 @@ def _render_pr_comment(
         ),
         *current_scan_lines,
         "<details>",
-        "<summary>Top findings and advisory details</summary>",
+        "<summary>Top risks and evidence</summary>",
         "",
     ]
     if top_findings:
         lines.extend(
-            f"- {str(finding.get('severity', 'medium')).upper()}: "
-            f"{_shorten(str(finding.get('title', 'Untitled finding')), finding_title_limit)} "
-            f"({int(finding.get('evidence_count') or 0)} evidence)"
+            f"- {_markdown_text(finding.get('severity') or 'medium').upper()}: "
+            f"{_shorten(_markdown_text(finding.get('title') or 'Untitled finding'), finding_title_limit)} "
+            f"({_safe_int(finding.get('evidence_count'))} evidence)"
             for finding in top_findings
         )
     else:
@@ -902,11 +1189,13 @@ def _success_summary(
     uploaded_files: list[tuple[str, bytes]],
     skipped_files: list[str],
 ) -> str:
-    data = dict(analysis_payload.get("data") or {})
-    share_summary = dict(data.get("share_summary") or {})
-    persisted_report = dict(data.get("persisted_report") or {})
+    analysis_payload = _mapping_or_empty(analysis_payload)
+    data = _mapping_or_empty(analysis_payload.get("data"))
+    share_summary = _mapping_or_empty(data.get("share_summary"))
+    share_json = _mapping_or_empty(share_summary.get("json_payload"))
+    persisted_report = _mapping_or_empty(data.get("persisted_report"))
     report_id = persisted_report.get("id")
-    report_link = (share_summary.get("json_payload") or {}).get("report_link")
+    report_link = _comment_link(share_json.get("report_link"))
 
     lines = [
         "## DeployWhisper analysis submitted",
@@ -919,7 +1208,7 @@ def _success_summary(
     if skipped_files:
         lines.append("- Skipped files:")
         lines.extend(f"  - {item}" for item in skipped_files)
-    markdown = str(share_summary.get("markdown") or "").strip()
+    markdown = _nonblank_string(share_summary.get("markdown"))
     if markdown:
         lines.extend(["", markdown])
     return "\n".join(lines)
@@ -1078,12 +1367,13 @@ def run_action(args: argparse.Namespace, environ: dict[str, str] | None = None) 
         trigger_id=_build_trigger_id(context),
     )
 
-    data = dict(payload.get("data") or {})
-    meta = dict(payload.get("meta") or {})
-    advisory = dict(data.get("advisory") or {})
-    share_summary = dict(data.get("share_summary") or {})
-    share_json = dict(share_summary.get("json_payload") or {})
-    persisted_report = dict(data.get("persisted_report") or {})
+    payload = _mapping_or_empty(payload)
+    data = _mapping_or_empty(payload.get("data"))
+    meta = _mapping_or_empty(payload.get("meta"))
+    advisory = _mapping_or_empty(data.get("advisory"))
+    share_summary = _mapping_or_empty(data.get("share_summary"))
+    share_json = _mapping_or_empty(share_summary.get("json_payload"))
+    persisted_report = _mapping_or_empty(data.get("persisted_report"))
 
     write_github_output("created", "true", env)
     write_github_output(

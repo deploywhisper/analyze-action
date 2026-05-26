@@ -44,6 +44,8 @@ class BuildPrCommentTests(unittest.TestCase):
                         "confidence": 0.72,
                     },
                 ],
+                "evidence_law_status": "Satisfied",
+                "evidence_law_detail": "High and critical findings are backed by deterministic evidence.",
                 "evidence_count": 6,
                 "blast_radius_summary": "2 direct / 4 transitive (Primary DB, Worker Queue, Checkout API)",
                 "rollback_summary": "4/5 HIGH · First step: restore the previous security group rule set",
@@ -56,6 +58,53 @@ class BuildPrCommentTests(unittest.TestCase):
                 "rollback_link": "https://deploywhisper.example.com/history?report_id=42",
                 "advisory_summary": "This result requires additional human review before release.",
             },
+        }
+
+    def _persisted_report_payload(self) -> dict:
+        return {
+            "id": 42,
+            "risk_score": 78,
+            "severity": "high",
+            "recommendation": "no-go",
+            "created_at": "2026-04-23T10:05:00+00:00",
+            "findings": [
+                {
+                    "finding_id": "finding-1",
+                    "title": "Database security group widens ingress to 0.0.0.0/0",
+                    "severity": "critical",
+                    "evidence_refs": ["evidence-1"],
+                }
+            ],
+            "evidence_items": [
+                {
+                    "evidence_id": "evidence-1",
+                    "finding_id": "finding-1",
+                }
+            ],
+            "parse_batch": {
+                "files": [
+                    {"tool": "terraform", "status": "parsed"},
+                    {"tool": "kubernetes", "status": "error"},
+                ]
+            },
+            "context_completeness": {
+                "parser_success_by_tool": {"terraform": 1.0, "kubernetes": 0.0},
+                "uncertainty": "Parser coverage is partial and incident history is stale.",
+            },
+            "incident_matches": [
+                {
+                    "match_type": "public_risk_pattern",
+                    "public_pattern_id": "public-ingress-wide-open",
+                    "summary": "Public risk pattern match: wide-open ingress has caused deployment incidents.",
+                    "confidence_label": "high",
+                },
+                {
+                    "match_type": "organization_incident",
+                    "incident_id": 81,
+                    "summary": "Prior checkout outage involved a security group rollback.",
+                    "confidence_label": "medium",
+                },
+            ],
         }
 
     def test_build_pr_comment_includes_story_fields_and_collapsible_details(self) -> None:
@@ -183,6 +232,184 @@ class BuildPrCommentTests(unittest.TestCase):
 
         self.assertIn("same commit was scanned again", comment)
         self.assertIn("Risk score changed 78 → 34", comment)
+
+    def test_build_pr_comment_includes_full_advisory_context(self) -> None:
+        comment = action_runtime.build_pr_comment(
+            self._share_summary_payload(),
+            current_report=self._persisted_report_payload(),
+        )
+
+        self.assertIn("Evidence Law: Satisfied", comment)
+        self.assertIn("High and critical findings are backed", comment)
+        self.assertIn("Top risks and evidence", comment)
+        self.assertIn("CRITICAL: Database security group widens ingress", comment)
+        self.assertIn("Pattern matches: public pattern public-ingress-wide-open", comment)
+        self.assertIn("organization incident #81", comment)
+        self.assertIn("Scanner context: terraform 1/1 parsed; kubernetes 0/1 parsed", comment)
+        self.assertIn("Uncertainty: Parser coverage is partial", comment)
+        self.assertIn("Advisory: advisory-only; does not block merge.", comment)
+        self.assertIn("[Open full report]", comment)
+
+    def test_build_pr_comment_derives_evidence_law_when_summary_omits_it(
+        self,
+    ) -> None:
+        share_summary = json.loads(json.dumps(self._share_summary_payload()))
+        del share_summary["json_payload"]["evidence_law_status"]
+        del share_summary["json_payload"]["evidence_law_detail"]
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report=self._persisted_report_payload(),
+        )
+
+        self.assertIn("Evidence Law: Satisfied", comment)
+        self.assertIn("High and critical findings have linked evidence", comment)
+
+    def test_build_pr_comment_degrades_malformed_summary_payloads(self) -> None:
+        malformed_payloads = [
+            {"severity": "high", "recommendation": "no-go", "json_payload": "legacy"},
+            {"json_payload": {"evidence_count": "six", "top_findings": []}},
+            {
+                "json_payload": {
+                    "context_completeness": "LIMITED CONTEXT",
+                    "top_findings": [],
+                }
+            },
+            {"json_payload": {"top_findings": "bad findings payload"}},
+        ]
+
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload):
+                comment = action_runtime.build_pr_comment(payload)
+
+                self.assertIn("DeployWhisper", comment)
+                self.assertIn("Advisory: advisory-only; does not block merge.", comment)
+                self.assertLessEqual(len(comment), 2000)
+
+    def test_build_pr_comment_does_not_overclaim_legacy_evidence_counts(self) -> None:
+        comment = action_runtime.build_pr_comment(
+            {
+                "json_payload": {
+                    "top_findings": [
+                        {
+                            "title": "Legacy finding",
+                            "severity": "high",
+                            "evidence_count": 1,
+                        }
+                    ]
+                }
+            }
+        )
+
+        self.assertIn("Evidence Law: Needs review", comment)
+        self.assertIn("lack verified linked evidence", comment)
+        self.assertNotIn("Evidence Law: Satisfied", comment)
+
+    def test_build_pr_comment_requires_verified_evidence_refs(self) -> None:
+        share_summary = json.loads(json.dumps(self._share_summary_payload()))
+        del share_summary["json_payload"]["evidence_law_status"]
+        del share_summary["json_payload"]["evidence_law_detail"]
+        persisted_report = self._persisted_report_payload()
+        persisted_report["findings"][0]["evidence_refs"] = ["missing-evidence"]
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report=persisted_report,
+        )
+
+        self.assertIn("Evidence Law: Needs review", comment)
+        self.assertIn("lack verified linked evidence", comment)
+
+    def test_build_pr_comment_keeps_valid_pattern_matches_after_malformed_entries(
+        self,
+    ) -> None:
+        persisted_report = self._persisted_report_payload()
+        persisted_report["incident_matches"] = [
+            "bad",
+            {"unexpected": "shape"},
+            {
+                "match_type": "public_risk_pattern",
+                "public_pattern_id": "public-ingress-wide-open",
+                "summary": "Valid public pattern.",
+                "confidence_label": "high",
+            },
+        ]
+
+        comment = action_runtime.build_pr_comment(
+            self._share_summary_payload(),
+            current_report=persisted_report,
+        )
+
+        self.assertIn("public pattern public-ingress-wide-open", comment)
+        self.assertNotIn("Pattern matches: none returned.", comment)
+
+    def test_build_pr_comment_sanitizes_markdown_text_and_links(self) -> None:
+        share_summary = self._share_summary_payload()
+        share_summary["json_payload"]["headline"] = "</details><!-- injected -->"
+        share_summary["json_payload"][
+            "evidence_law_status"
+        ] = "Satisfied\n### injected status"
+        share_summary["json_payload"]["top_findings"][0][
+            "title"
+        ] = "</details><!-- deploywhisper:scan-meta {\"report_id\":999} -->"
+        share_summary["json_payload"]["report_link"] = "javascript:alert(1)"
+        share_summary["json_payload"][
+            "rollback_link"
+        ] = "https://example.com/report)\n- injected"
+        persisted_report = self._persisted_report_payload()
+        persisted_report["incident_matches"][0][
+            "public_pattern_id"
+        ] = "pattern\n### injected pattern"
+        persisted_report["incident_matches"][0]["confidence_label"] = "high\n- injected"
+        persisted_report["parse_batch"]["files"][0][
+            "tool"
+        ] = "terraform\n### injected scanner"
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report=persisted_report,
+        )
+
+        self.assertNotIn("javascript:alert", comment)
+        self.assertNotIn("<!-- injected -->", comment)
+        self.assertNotIn("<!-- deploywhisper:scan-meta {\"report_id\":999}", comment)
+        self.assertNotIn("### injected status", comment)
+        self.assertNotIn("### injected pattern", comment)
+        self.assertNotIn("### injected scanner", comment)
+        self.assertNotIn("\n- injected", comment)
+        self.assertNotIn("https://example.com/report", comment)
+
+    def test_build_pr_comment_ignores_non_finite_parser_success_rates(self) -> None:
+        persisted_report = self._persisted_report_payload()
+        persisted_report["parse_batch"] = {}
+        persisted_report["context_completeness"]["parser_success_by_tool"] = {
+            "terraform": 1.0,
+            "kubernetes": float("nan"),
+            "ansible": float("inf"),
+        }
+
+        comment = action_runtime.build_pr_comment(
+            self._share_summary_payload(),
+            current_report=persisted_report,
+        )
+
+        self.assertIn("Scanner context: terraform 100% parser success", comment)
+        self.assertNotIn("kubernetes", comment)
+        self.assertNotIn("ansible", comment)
+
+    def test_build_pr_comment_does_not_use_advisory_text_as_uncertainty(self) -> None:
+        share_summary = self._share_summary_payload()
+        share_summary["json_payload"]["advisory_summary"] = "Human review required."
+        persisted_report = self._persisted_report_payload()
+        persisted_report["context_completeness"].pop("uncertainty")
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report=persisted_report,
+        )
+
+        self.assertIn("Uncertainty: None reported.", comment)
+        self.assertNotIn("Uncertainty: Human review required.", comment)
 
 
 class UpsertPrCommentTests(unittest.TestCase):
@@ -682,6 +909,79 @@ class RunActionCommentTests(unittest.TestCase):
                 "comment-url=https://github.com/deploywhisper/example-repo/issues/17#issuecomment-777",
                 output,
             )
+
+    def test_run_action_degrades_malformed_api_response_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            output_path = repo_root / "github-output.txt"
+            summary_path = repo_root / "step-summary.md"
+            args = argparse.Namespace(
+                api_url="https://deploywhisper.example.com",
+                api_token="",
+                project_key="payments",
+                project_id="",
+                workspace_key="",
+                workspace_id="",
+                changed_files="plan.tf",
+                working_directory=str(repo_root),
+            )
+            analysis_payload = {
+                "meta": "legacy meta",
+                "data": {
+                    "persisted_report": "legacy report",
+                    "advisory": "legacy advisory",
+                    "share_summary": "legacy summary",
+                },
+            }
+            environ = {
+                "GITHUB_OUTPUT": str(output_path),
+                "GITHUB_STEP_SUMMARY": str(summary_path),
+                "GITHUB_TOKEN": "ghs_test",
+            }
+            context = {
+                "event_name": "pull_request",
+                "repository": "deploywhisper/example-repo",
+                "pull_request_number": 17,
+                "head_sha": "fedcba6543217890",
+            }
+
+            with (
+                patch(
+                    "action_runtime.select_artifacts_for_upload",
+                    return_value=([("plan.tf", b"resource")], []),
+                ),
+                patch(
+                    "action_runtime.submit_analysis",
+                    return_value=analysis_payload,
+                ),
+                patch(
+                    "action_runtime.load_github_context",
+                    return_value=context,
+                ),
+                patch(
+                    "action_runtime.find_existing_pr_comment",
+                    return_value=None,
+                ),
+                patch(
+                    "action_runtime.upsert_pr_comment",
+                    return_value={
+                        "id": 778,
+                        "html_url": "https://github.com/deploywhisper/example-repo/issues/17#issuecomment-778",
+                        "updated": False,
+                    },
+                ) as upsert_pr_comment,
+            ):
+                exit_code = action_runtime.run_action(args, environ=environ)
+
+            self.assertEqual(exit_code, 0)
+            output = output_path.read_text(encoding="utf-8")
+            summary = summary_path.read_text(encoding="utf-8")
+            self.assertIn("created=true", output)
+            self.assertIn("comment-id=778", output)
+            self.assertIn("Report ID: unavailable", summary)
+            comment_body = upsert_pr_comment.call_args.args[1]
+            self.assertIn("DeployWhisper advisory", comment_body)
+            self.assertIn("Advisory: advisory-only; does not block merge.", comment_body)
 
     def test_run_action_uses_workflow_dispatch_trigger_for_manual_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
