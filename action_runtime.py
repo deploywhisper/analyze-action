@@ -384,6 +384,11 @@ def validate_scope_inputs(
         raise ActionRuntimeError(
             "Provide only one workspace scope input: workspace-key or workspace-id."
         )
+    if (workspace_key or workspace_id) and not project_key and not project_id:
+        raise ActionRuntimeError(
+            "Workspace scope is project-local. Provide project-key or project-id "
+            "with workspace-key or workspace-id."
+        )
     if not project_key and not project_id and not allow_derived_project_scope:
         raise ActionRuntimeError(
             "Project scope is required. Provide project-key or project-id, "
@@ -486,15 +491,19 @@ def extract_comment_metadata(comment_body: str) -> dict[str, object] | None:
     if not isinstance(payload, dict):
         return None
     try:
+        report_id = int(payload["report_id"])
+        risk_score = int(payload["risk_score"])
+        if report_id <= 0 or risk_score < 0:
+            return None
         return {
-            "report_id": int(payload.get("report_id") or 0),
-            "risk_score": int(payload.get("risk_score") or 0),
+            "report_id": report_id,
+            "risk_score": risk_score,
             "severity": str(payload.get("severity") or "").lower(),
             "recommendation": str(payload.get("recommendation") or "").lower(),
             "created_at": str(payload.get("created_at") or ""),
             "head_sha": str(payload.get("head_sha") or "")[:12],
         }
-    except (TypeError, ValueError):
+    except (KeyError, TypeError, ValueError):
         return None
 
 
@@ -509,6 +518,10 @@ def _current_scan_meta(
         "created_at": str(current_report.get("created_at") or ""),
         "head_sha": (head_sha or "")[:12],
     }
+
+
+def _nonblank_string(value: object) -> str:
+    return str(value or "").strip()
 
 
 def _previous_scan_summary(
@@ -1058,12 +1071,14 @@ def run_action(args: argparse.Namespace, environ: dict[str, str] | None = None) 
     write_github_output("report-link", share_json.get("report_link", ""), env)
     write_github_output(
         "severity",
-        advisory.get("severity") or share_summary.get("severity", ""),
+        _nonblank_string(advisory.get("severity"))
+        or _nonblank_string(share_summary.get("severity")),
         env,
     )
     write_github_output(
         "recommendation",
-        advisory.get("recommendation") or share_summary.get("recommendation", ""),
+        _nonblank_string(advisory.get("recommendation"))
+        or _nonblank_string(share_summary.get("recommendation")),
         env,
     )
     write_github_output("share-summary-json", share_json, env)

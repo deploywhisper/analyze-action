@@ -46,6 +46,10 @@ for example `deploywhisper/analyze-action`.
    - uses: deploywhisper/analyze-action@v1.0.1
    ```
 
+   The `deploywhisper/action-smoke-consumer` workflow keeps this immutable
+   action ref as a literal `uses:` value. Bump that workflow to the new
+   semantic version tag before treating the immutable release smoke as complete.
+
 4. Move the major compatibility tag to the same reviewed commit:
 
    ```bash

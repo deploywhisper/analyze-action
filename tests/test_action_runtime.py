@@ -344,6 +344,32 @@ class UpsertPrCommentTests(unittest.TestCase):
 
         self.assertIsNone(metadata)
 
+    def test_extract_comment_metadata_ignores_partial_scan_marker(self) -> None:
+        body = "\n".join(
+            [
+                "<!-- deploywhisper:pr-comment -->",
+                '<!-- deploywhisper:scan-meta {"severity":"high","recommendation":"no-go"} -->',
+                "existing body",
+            ]
+        )
+
+        metadata = action_runtime.extract_comment_metadata(body)
+
+        self.assertIsNone(metadata)
+
+    def test_extract_comment_metadata_ignores_zero_report_marker(self) -> None:
+        body = "\n".join(
+            [
+                "<!-- deploywhisper:pr-comment -->",
+                '<!-- deploywhisper:scan-meta {"report_id":0,"risk_score":78,"severity":"high"} -->',
+                "existing body",
+            ]
+        )
+
+        metadata = action_runtime.extract_comment_metadata(body)
+
+        self.assertIsNone(metadata)
+
 
 class SubmitAnalysisTests(unittest.TestCase):
     def test_submit_analysis_maps_scope_inputs_to_multipart_fields(self) -> None:
@@ -435,6 +461,19 @@ class ScopeInputValidationTests(unittest.TestCase):
 
         self.assertEqual(scope["project_key"], "")
         self.assertEqual(scope["project_id"], "")
+
+    def test_validate_scope_inputs_rejects_workspace_without_project_scope(self) -> None:
+        with self.assertRaisesRegex(
+            action_runtime.ActionRuntimeError,
+            "Workspace scope is project-local",
+        ):
+            action_runtime.validate_scope_inputs(
+                project_key="",
+                project_id="",
+                workspace_key="prod",
+                workspace_id="",
+                allow_derived_project_scope=True,
+            )
 
     def test_validate_scope_inputs_rejects_project_key_and_id(self) -> None:
         with self.assertRaisesRegex(
@@ -710,8 +749,8 @@ class RunActionCommentTests(unittest.TestCase):
                 "data": {
                     "persisted_report": {"id": 42},
                     "advisory": {
-                        "severity": "",
-                        "recommendation": None,
+                        "severity": "  ",
+                        "recommendation": "\t",
                     },
                     "share_summary": {
                         "severity": "medium",
