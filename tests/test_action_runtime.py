@@ -265,6 +265,7 @@ class BuildPrCommentTests(unittest.TestCase):
             "head_sha": "abcdef123456",
             "findings": [
                 {
+                    "finding_id": "finding-persistent-new-id",
                     "title": "Database security group widens ingress to 0.0.0.0/0",
                     "severity": "critical",
                 },
@@ -287,6 +288,225 @@ class BuildPrCommentTests(unittest.TestCase):
         self.assertIn("Resolved finding: MEDIUM Rollback depends", comment)
         self.assertIn("Persistent finding: CRITICAL Database security group", comment)
         self.assertIn('"findings":[', comment.replace(" ", ""))
+        self.assertLessEqual(len(comment), 2000)
+
+    def test_build_pr_comment_reports_all_resolved_and_all_new_findings(self) -> None:
+        share_summary = self._share_summary_payload()
+        previous_scan = {
+            "report_id": 41,
+            "risk_score": 78,
+            "severity": "high",
+            "recommendation": "no-go",
+            "created_at": "2026-04-23T09:55:00+00:00",
+            "finding_keys": ["previous-finding-1"],
+            "findings": [
+                {
+                    "key": "previous-finding-1",
+                    "title": "Ingress was open",
+                    "severity": "high",
+                }
+            ],
+        }
+
+        resolved_comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report={
+                "id": 42,
+                "risk_score": 12,
+                "severity": "low",
+                "recommendation": "go",
+                "created_at": "2026-04-23T10:05:00+00:00",
+                "findings": [],
+            },
+            previous_scan=previous_scan,
+        )
+
+        self.assertIn("Finding changes: 0 new / 1 resolved / 0 persistent", resolved_comment)
+        self.assertIn("Resolved finding: HIGH Ingress was open", resolved_comment)
+
+        new_comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report={
+                "id": 43,
+                "risk_score": 88,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T10:10:00+00:00",
+                "findings": [
+                    {
+                        "finding_id": "finding-new-after-clean-scan",
+                        "title": "New public endpoint is exposed",
+                        "severity": "high",
+                    }
+                ],
+            },
+            previous_scan={
+                "report_id": 42,
+                "risk_score": 0,
+                "severity": "low",
+                "recommendation": "go",
+                "created_at": "2026-04-23T10:05:00+00:00",
+                "finding_keys": [],
+                "findings": [],
+            },
+        )
+
+        self.assertIn("Finding changes: 1 new / 0 resolved / 0 persistent", new_comment)
+        self.assertIn("New finding: HIGH New public endpoint is exposed", new_comment)
+
+    def test_build_pr_comment_uses_stable_ids_for_changed_titles_and_duplicates(
+        self,
+    ) -> None:
+        share_summary = self._share_summary_payload()
+        previous_scan = {
+            "report_id": 41,
+            "risk_score": 78,
+            "severity": "high",
+            "recommendation": "no-go",
+            "created_at": "2026-04-23T09:55:00+00:00",
+            "finding_keys": [
+                action_runtime._finding_identity_key({"finding_id": "finding-shared"}),
+                action_runtime._finding_identity_key({"finding_id": "finding-duplicate-a"}),
+            ],
+            "findings": [
+                {
+                    "key": action_runtime._finding_identity_key(
+                        {"finding_id": "finding-shared"}
+                    ),
+                    "title": "Old ingress wording",
+                    "severity": "high",
+                },
+                {
+                    "key": action_runtime._finding_identity_key(
+                        {"finding_id": "finding-duplicate-a"}
+                    ),
+                    "title": "Duplicate title",
+                    "severity": "medium",
+                },
+            ],
+        }
+        current_report = {
+            "id": 42,
+            "risk_score": 88,
+            "severity": "high",
+            "recommendation": "no-go",
+            "created_at": "2026-04-23T10:05:00+00:00",
+            "findings": [
+                {
+                    "finding_id": "finding-shared",
+                    "title": "New ingress wording",
+                    "severity": "high",
+                },
+                {
+                    "finding_id": "finding-duplicate-a",
+                    "title": "Duplicate title",
+                    "severity": "medium",
+                },
+                {
+                    "finding_id": "finding-duplicate-b",
+                    "title": "Duplicate title",
+                    "severity": "medium",
+                },
+            ],
+        }
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report=current_report,
+            previous_scan=previous_scan,
+        )
+
+        self.assertIn("Finding changes: 1 new / 0 resolved / 2 persistent", comment)
+        self.assertNotIn("1 resolved", comment)
+
+    def test_build_pr_comment_counts_more_than_twelve_findings_before_truncating_labels(
+        self,
+    ) -> None:
+        share_summary = self._share_summary_payload()
+        previous_findings = [
+            {
+                "finding_id": f"finding-{index}",
+                "title": f"Persistent finding {index}",
+                "severity": "medium",
+            }
+            for index in range(13)
+        ]
+        previous_keys = [
+            action_runtime._finding_identity_key(finding) for finding in previous_findings
+        ]
+        current_findings = previous_findings + [
+            {
+                "finding_id": "finding-new-thirteen-plus",
+                "title": "New finding beyond the old twelve item limit",
+                "severity": "high",
+            }
+        ]
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report={
+                "id": 42,
+                "risk_score": 88,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T10:05:00+00:00",
+                "findings": current_findings,
+            },
+            previous_scan={
+                "report_id": 41,
+                "risk_score": 78,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T09:55:00+00:00",
+                "finding_keys": previous_keys,
+                "findings": [
+                    {
+                        "key": key,
+                        "title": finding["title"],
+                        "severity": finding["severity"],
+                    }
+                    for key, finding in zip(previous_keys, previous_findings)
+                ],
+            },
+        )
+
+        self.assertIn("Finding changes: 1 new / 0 resolved / 13 persistent", comment)
+        self.assertIn("New finding: HIGH New finding beyond", comment)
+
+    def test_build_pr_comment_keeps_hidden_metadata_within_comment_budget(self) -> None:
+        share_summary = self._share_summary_payload()
+        long_title = "very long finding title " * 140
+        current_report = {
+            "id": 42,
+            "risk_score": 88,
+            "severity": "high",
+            "recommendation": "no-go",
+            "created_at": "2026-04-23T10:05:00+00:00",
+            "findings": [
+                {
+                    "finding_id": f"finding-{index}",
+                    "title": f"{long_title} {index}",
+                    "severity": "high",
+                }
+                for index in range(12)
+            ],
+        }
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report=current_report,
+            previous_scan={
+                "report_id": 41,
+                "risk_score": 0,
+                "severity": "low",
+                "recommendation": "go",
+                "created_at": "2026-04-23T09:55:00+00:00",
+                "finding_keys": [],
+                "findings": [],
+            },
+        )
+
+        self.assertIn("deploywhisper:scan-meta", comment)
         self.assertLessEqual(len(comment), 2000)
 
     def test_build_pr_comment_includes_full_advisory_context(self) -> None:
@@ -613,6 +833,7 @@ class UpsertPrCommentTests(unittest.TestCase):
         self.assertEqual(metadata["risk_score"], 78)
         self.assertEqual(metadata["severity"], "high")
         self.assertEqual(metadata["head_sha"], "abcdef123456")
+        self.assertEqual(len(metadata["finding_keys"]), 2)
         self.assertEqual(len(metadata["findings"]), 2)
         self.assertEqual(metadata["findings"][0]["severity"], "critical")
         self.assertIn("Database security group", metadata["findings"][0]["title"])

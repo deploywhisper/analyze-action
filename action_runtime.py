@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import UTC, datetime
+import hashlib
 import json
 import math
 import os
@@ -18,6 +19,10 @@ import uuid
 COMMENT_MARKER = "<!-- deploywhisper:pr-comment -->"
 SCAN_META_MARKER = "deploywhisper:scan-meta"
 GITHUB_API_BASE_URL = "https://api.github.com"
+MAX_PR_COMMENT_LENGTH = 2000
+SCAN_META_KEY_LIMIT = 32
+SCAN_META_LABEL_LIMIT = 6
+SCAN_META_KEY_LENGTH = 16
 SENSITIVE_FILE_MARKERS = {
     ".env",
     ".pem",
@@ -507,6 +512,16 @@ def extract_comment_metadata(comment_body: str) -> dict[str, object] | None:
         risk_score = _scan_meta_int(payload, "risk_score")
         if report_id <= 0 or risk_score < 0:
             return None
+        findings = _scan_meta_findings(payload.get("findings"))
+        finding_keys = (
+            [
+                _scan_meta_text(item, SCAN_META_KEY_LENGTH)
+                for item in payload.get("finding_keys", [])
+                if _scan_meta_text(item, SCAN_META_KEY_LENGTH)
+            ]
+            if isinstance(payload.get("finding_keys"), list)
+            else [item["key"] for item in findings]
+        )
         return {
             "report_id": report_id,
             "risk_score": risk_score,
@@ -514,7 +529,10 @@ def extract_comment_metadata(comment_body: str) -> dict[str, object] | None:
             "recommendation": str(payload.get("recommendation") or "").lower(),
             "created_at": str(payload.get("created_at") or ""),
             "head_sha": str(payload.get("head_sha") or ""),
-            "findings": _scan_meta_findings(payload.get("findings")),
+            "finding_keys": finding_keys,
+            "findings": findings,
+            "findings_total": _safe_int(payload.get("findings_total"), len(finding_keys)),
+            "findings_truncated": bool(payload.get("findings_truncated")),
         }
     except (KeyError, TypeError, ValueError):
         return None
@@ -523,15 +541,25 @@ def extract_comment_metadata(comment_body: str) -> dict[str, object] | None:
 def _current_scan_meta(
     current_report: dict[str, object], *, head_sha: str | None
 ) -> dict[str, object]:
-    return {
+    finding_keys, findings_total, findings_truncated = _scan_meta_finding_keys(
+        current_report.get("findings")
+    )
+    scan_meta = {
         "report_id": _safe_int(current_report.get("id")),
         "risk_score": _safe_int(current_report.get("risk_score")),
         "severity": str(current_report.get("severity") or "").lower(),
         "recommendation": str(current_report.get("recommendation") or "").lower(),
         "created_at": str(current_report.get("created_at") or ""),
-        "head_sha": head_sha or "",
-        "findings": _scan_meta_findings(current_report.get("findings")),
     }
+    if head_sha:
+        scan_meta["head_sha"] = head_sha
+    if finding_keys:
+        scan_meta["finding_keys"] = finding_keys
+        scan_meta["findings"] = _scan_meta_findings(current_report.get("findings"))
+    if findings_truncated:
+        scan_meta["findings_total"] = findings_total
+        scan_meta["findings_truncated"] = True
+    return scan_meta
 
 
 def _nonblank_string(value: object) -> str:
@@ -617,6 +645,11 @@ def _scan_meta_text(value: object, limit: int) -> str:
     )
 
 
+def _compact_finding_key(value: str) -> str:
+    normalized = " ".join(value.lower().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:SCAN_META_KEY_LENGTH]
+
+
 def _finding_title(finding: dict[str, object]) -> str:
     return (
         _nonblank_string(finding.get("title"))
@@ -635,7 +668,11 @@ def _finding_severity(finding: dict[str, object]) -> str:
 def _finding_identity_key(finding: dict[str, object]) -> str:
     existing_key = _nonblank_string(finding.get("key"))
     if existing_key:
-        return existing_key
+        return _scan_meta_text(existing_key, SCAN_META_KEY_LENGTH)
+    for field_name in ("finding_id", "id"):
+        stable_id = _nonblank_string(finding.get(field_name))
+        if stable_id:
+            return _compact_finding_key(f"{field_name}:{stable_id}")
     title = _finding_title(finding)
     if not title:
         return ""
@@ -644,10 +681,12 @@ def _finding_identity_key(finding: dict[str, object]) -> str:
         or _nonblank_string(finding.get("resource_category"))
     )
     identity = f"{category}|{title}".lower()
-    return re.sub(r"[^a-z0-9]+", " ", identity).strip()
+    return _compact_finding_key(re.sub(r"[^a-z0-9]+", " ", identity).strip())
 
 
-def _scan_meta_findings(value: object, *, limit: int = 12) -> list[dict[str, str]]:
+def _scan_meta_findings(
+    value: object, *, limit: int = SCAN_META_LABEL_LIMIT
+) -> list[dict[str, str]]:
     findings: list[dict[str, str]] = []
     seen: set[str] = set()
     for raw_finding in _dict_items(value):
@@ -662,18 +701,54 @@ def _scan_meta_findings(value: object, *, limit: int = 12) -> list[dict[str, str
             {
                 "key": key,
                 "severity": _scan_meta_text(_finding_severity(raw_finding), 16),
-                "title": _scan_meta_text(title, 96),
+                "title": _scan_meta_text(title, 72),
             }
         )
     return findings
 
 
-def _finding_lookup(value: object) -> dict[str, dict[str, str]]:
-    return {
-        item["key"]: item
-        for item in _scan_meta_findings(value)
-        if _nonblank_string(item.get("key"))
-    }
+def _scan_meta_finding_keys(
+    value: object, *, limit: int = SCAN_META_KEY_LIMIT
+) -> tuple[list[str], int, bool]:
+    keys: list[str] = []
+    seen: set[str] = set()
+    total = 0
+    for raw_finding in _dict_items(value):
+        key = _finding_identity_key(raw_finding)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        total += 1
+        if len(keys) < limit:
+            keys.append(key)
+    return keys, total, total > len(keys)
+
+
+def _finding_lookup(value: object) -> dict[str, dict[str, str]] | None:
+    if isinstance(value, dict):
+        raw_keys = value.get("finding_keys")
+        labels = {
+            item["key"]: item
+            for item in _scan_meta_findings(value.get("findings"))
+            if _nonblank_string(item.get("key"))
+        }
+        if isinstance(raw_keys, list):
+            lookup: dict[str, dict[str, str]] = {}
+            for raw_key in raw_keys:
+                key = _scan_meta_text(raw_key, SCAN_META_KEY_LENGTH)
+                if key:
+                    lookup[key] = labels.get(key, {"key": key, "severity": "unknown"})
+            return lookup
+        if "findings" in value:
+            return labels
+        return None
+    if isinstance(value, list):
+        return {
+            item["key"]: item
+            for item in _scan_meta_findings(value, limit=len(value))
+            if _nonblank_string(item.get("key"))
+        }
+    return None
 
 
 def _finding_delta(
@@ -682,9 +757,9 @@ def _finding_delta(
 ) -> dict[str, list[dict[str, str]]]:
     if not previous_scan or not current_report:
         return {"new": [], "resolved": [], "persistent": []}
-    previous = _finding_lookup(previous_scan.get("findings"))
+    previous = _finding_lookup(previous_scan)
     current = _finding_lookup(current_report.get("findings"))
-    if not previous or not current:
+    if previous is None or current is None:
         return {"new": [], "resolved": [], "persistent": []}
     previous_keys = set(previous)
     current_keys = set(current)
@@ -710,11 +785,16 @@ def _finding_delta_lines(
     delta = _finding_delta(previous_scan, current_report)
     if not any(delta.values()):
         return []
+    partial = (
+        isinstance(previous_scan, dict)
+        and bool(previous_scan.get("findings_truncated"))
+    )
+    partial_note = " (partial; previous marker capped)" if partial else ""
     lines = [
         (
             "- Finding changes: "
             f"{len(delta['new'])} new / {len(delta['resolved'])} resolved / "
-            f"{len(delta['persistent'])} persistent"
+            f"{len(delta['persistent'])} persistent{partial_note}"
         )
     ]
     examples = (
@@ -1155,7 +1235,7 @@ def build_pr_comment(
         ),
     ]
     for comment in candidates:
-        if len(comment) <= 2000:
+        if len(comment) <= MAX_PR_COMMENT_LENGTH:
             return comment
 
     fallback = _render_pr_comment(
@@ -1169,7 +1249,7 @@ def build_pr_comment(
         compact_links=True,
         compact_context=True,
     )
-    if len(fallback) <= 2000:
+    if len(fallback) <= MAX_PR_COMMENT_LENGTH:
         return fallback
     meta_prefix = f"\n<!-- {SCAN_META_MARKER} "
     meta_suffix = ""
@@ -1180,7 +1260,9 @@ def build_pr_comment(
     closing = "\n</details>"
     opening, _, _ = fallback.rpartition(closing)
     reserved = len(closing) + len(meta_suffix) + 8
-    available = max(2000 - reserved, 64)
+    available = MAX_PR_COMMENT_LENGTH - reserved
+    if available < 64:
+        return _shorten(fallback, MAX_PR_COMMENT_LENGTH)
     return _shorten(opening, available).rstrip() + closing + meta_suffix
 
 
