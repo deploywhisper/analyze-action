@@ -156,7 +156,7 @@ class BuildPrCommentTests(unittest.TestCase):
         self.assertIn("Previous analysis: report #41", comment)
         self.assertIn("Current analysis: report #42", comment)
 
-    def test_build_pr_comment_suppresses_delta_for_same_commit_rerun(self) -> None:
+    def test_build_pr_comment_keeps_delta_for_same_commit_rerun(self) -> None:
         share_summary = self._share_summary_payload()
         current_report = {
             "id": 42,
@@ -181,8 +181,8 @@ class BuildPrCommentTests(unittest.TestCase):
             head_sha="abcdef1234567890",
         )
 
-        self.assertIn("rerun of the same commit", comment)
-        self.assertNotIn("Risk score changed", comment)
+        self.assertIn("same commit was scanned again", comment)
+        self.assertIn("Risk score changed 78 → 34", comment)
 
 
 class UpsertPrCommentTests(unittest.TestCase):

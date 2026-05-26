@@ -512,7 +512,7 @@ def extract_comment_metadata(comment_body: str) -> dict[str, object] | None:
             "severity": str(payload.get("severity") or "").lower(),
             "recommendation": str(payload.get("recommendation") or "").lower(),
             "created_at": str(payload.get("created_at") or ""),
-            "head_sha": str(payload.get("head_sha") or "")[:12],
+            "head_sha": str(payload.get("head_sha") or ""),
         }
     except (KeyError, TypeError, ValueError):
         return None
@@ -527,7 +527,7 @@ def _current_scan_meta(
         "severity": str(current_report.get("severity") or "").lower(),
         "recommendation": str(current_report.get("recommendation") or "").lower(),
         "created_at": str(current_report.get("created_at") or ""),
-        "head_sha": (head_sha or "")[:12],
+        "head_sha": head_sha or "",
     }
 
 
@@ -544,9 +544,17 @@ def _previous_scan_summary(
     if not previous_scan or not current_report:
         return []
     previous_head_sha = str(previous_scan.get("head_sha") or "")
-    current_head_sha = (current_head_sha or "")[:12]
-    if previous_head_sha and current_head_sha and previous_head_sha == current_head_sha:
-        return ["- Change since last scan: rerun of the same commit."]
+    current_head_sha = current_head_sha or ""
+    same_commit_rerun = (
+        bool(previous_head_sha and current_head_sha)
+        and (
+            previous_head_sha == current_head_sha
+            or (
+                len(previous_head_sha) == 12
+                and current_head_sha.startswith(previous_head_sha)
+            )
+        )
+    )
     previous_score = int(previous_scan.get("risk_score") or 0)
     current_score = int(current_report.get("risk_score") or 0)
     previous_severity = str(previous_scan.get("severity") or "unknown").upper()
@@ -562,6 +570,11 @@ def _previous_scan_summary(
             f"{_format_timestamp(str(previous_scan.get('created_at') or ''))}"
         ),
     ]
+    if same_commit_rerun:
+        lines.insert(
+            1,
+            "- Rerun context: same commit was scanned again; deltas may reflect changed rules, parser behavior, incidents, or action inputs.",
+        )
     return lines
 
 

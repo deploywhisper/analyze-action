@@ -57,7 +57,7 @@ outputs:
     description: Persisted DeployWhisper report identifier.
     value: ${{ steps.deploywhisper.outputs.report-id }}
   report-link:
-    description: Shareable report link when APP_BASE_URL is configured on the server.
+    description: Report link. Publicly shareable only when APP_BASE_URL or PUBLIC_APP_URL is configured; otherwise it may be local/private.
     value: ${{ steps.deploywhisper.outputs.report-link }}
   severity:
     description: Shared risk severity for the generated report.

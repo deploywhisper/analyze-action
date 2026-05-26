@@ -65,7 +65,7 @@ jobs:
 | `submitted-artifact-count` | Number of supported artifacts uploaded. |
 | `accepted-artifact-count` | Number of artifacts accepted by the API. |
 | `report-id` | Persisted DeployWhisper report id. |
-| `report-link` | Shareable report link when configured server-side. |
+| `report-link` | Report link. Publicly shareable only when `APP_BASE_URL` or `PUBLIC_APP_URL` is configured server-side; otherwise it may be local/private and consumers should treat it as optional. |
 | `severity` | Advisory severity. Uses `data.advisory.severity`, falling back to `data.share_summary.severity` when advisory is blank. |
 | `recommendation` | Advisory recommendation. Uses `data.advisory.recommendation`, falling back to `data.share_summary.recommendation` when advisory is blank. |
 | `share-summary-json` | JSON-encoded `data.share_summary.json_payload`. |
@@ -81,7 +81,8 @@ jobs:
 - Filters unsupported and sensitive files locally before upload.
 - Submits explicit project and optional workspace scope when configured.
 - Compares the latest report with the previous PR scan when the scan marker is
-  valid and the commit changed.
+  valid, including same-commit reruns where rules, parsers, incidents, or inputs
+  may have changed.
 - Treats malformed previous scan markers as absent so comment updates can still
   proceed.
 
