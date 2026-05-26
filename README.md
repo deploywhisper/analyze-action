@@ -86,6 +86,9 @@ jobs:
 - Compares the latest report with the previous PR scan when the scan marker is
   valid, including same-commit reruns where rules, parsers, incidents, or inputs
   may have changed.
+- Highlights finding-level deltas across reruns: new, resolved, and persistent
+  findings are summarized in the PR comment when prior scan metadata is
+  available.
 - Treats malformed previous scan markers as absent so comment updates can still
   proceed.
 
