@@ -20,7 +20,7 @@ COMMENT_MARKER = "<!-- deploywhisper:pr-comment -->"
 SCAN_META_MARKER = "deploywhisper:scan-meta"
 GITHUB_API_BASE_URL = "https://api.github.com"
 MAX_PR_COMMENT_LENGTH = 2000
-SCAN_META_KEY_LIMIT = 64
+SCAN_META_KEY_LIMIT = 88
 SCAN_META_LABEL_LIMIT = 32
 SCAN_META_KEY_LENGTH = 16
 SCAN_META_MARKER_LENGTH_LIMIT = 1600
@@ -639,7 +639,7 @@ def _current_scan_meta(
         scan_meta["head_sha"] = head_sha
     if finding_keys:
         scan_meta["finding_keyset"] = _pack_finding_keys(finding_keys)
-        label_limit = len(finding_keys) if len(finding_keys) <= SCAN_META_LABEL_LIMIT else 0
+        label_limit = min(len(finding_keys), SCAN_META_LABEL_LIMIT)
         findings = _scan_meta_findings(current_report.get("findings"), limit=label_limit)
         if findings:
             scan_meta["findings"] = findings
@@ -821,8 +821,12 @@ def _finding_identity_key(finding: dict[str, object]) -> str:
         or _nonblank_string(finding.get("resource_category"))
     )
     discriminator = _finding_discriminator(finding)
-    identity = f"{category}|{title}|{discriminator}".lower()
-    return _compact_finding_key(re.sub(r"[^a-z0-9]+", " ", identity).strip())
+    identity = {
+        "category": _single_line_string(category).lower(),
+        "title": _single_line_string(title).lower(),
+        "discriminator": discriminator.lower(),
+    }
+    return _compact_finding_key(json.dumps(identity, separators=(",", ":"), sort_keys=True))
 
 
 def _finding_discriminator(finding: dict[str, object]) -> str:
@@ -849,8 +853,13 @@ def _finding_discriminator(finding: dict[str, object]) -> str:
     if isinstance(evidence_refs, list):
         values.extend(
             f"evidence:{item_value}"
-            for item in evidence_refs
-            if (item_value := _nonblank_string(item))
+            for item_value in sorted(
+                {
+                    _single_line_string(item).lower()
+                    for item in evidence_refs
+                    if _single_line_string(item)
+                }
+            )
         )
     return "|".join(values)
 

@@ -564,6 +564,54 @@ class BuildPrCommentTests(unittest.TestCase):
         self.assertIn("New finding: HIGH New finding beyond", comment)
         self.assertNotIn("exact new / resolved / persistent counts are unavailable", comment)
 
+    def test_build_pr_comment_compares_previous_marker_above_sixty_four_findings(
+        self,
+    ) -> None:
+        share_summary = self._share_summary_payload()
+        previous_findings = [
+            {
+                "finding_id": f"finding-{index}",
+                "title": f"Persistent finding {index}",
+                "severity": "medium",
+            }
+            for index in range(65)
+        ]
+        previous_scan = action_runtime._current_scan_meta(
+            {
+                "id": 41,
+                "risk_score": 78,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T09:55:00+00:00",
+                "findings": previous_findings,
+            },
+            head_sha="abcdef123456",
+        )
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report={
+                "id": 42,
+                "risk_score": 88,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T10:05:00+00:00",
+                "findings": previous_findings
+                + [
+                    {
+                        "finding_id": "finding-new-sixty-five-plus",
+                        "title": "New finding beyond sixty four",
+                        "severity": "high",
+                    }
+                ],
+            },
+            previous_scan=previous_scan,
+        )
+
+        self.assertIn("Finding changes: 1 new / 0 resolved / 65 persistent", comment)
+        self.assertIn("New finding: HIGH New finding beyond", comment)
+        self.assertNotIn("exact new / resolved / persistent counts are unavailable", comment)
+
     def test_build_pr_comment_labels_resolved_finding_in_medium_sized_marker(self) -> None:
         share_summary = self._share_summary_payload()
         previous_findings = [
@@ -605,6 +653,49 @@ class BuildPrCommentTests(unittest.TestCase):
         self.assertIn("Finding changes: 0 new / 1 resolved / 19 persistent", comment)
         self.assertIn("Resolved finding: MEDIUM Persistent finding 8", comment)
         self.assertNotIn("UNKNOWN Untitled finding", comment)
+
+    def test_build_pr_comment_keeps_labels_for_previous_marker_above_thirty_two(
+        self,
+    ) -> None:
+        share_summary = self._share_summary_payload()
+        previous_findings = [
+            {
+                "finding_id": f"finding-{index}",
+                "title": f"Persistent finding {index}",
+                "severity": "medium",
+            }
+            for index in range(40)
+        ]
+        current_findings = [
+            finding for index, finding in enumerate(previous_findings) if index != 8
+        ]
+        previous_scan = action_runtime._current_scan_meta(
+            {
+                "id": 41,
+                "risk_score": 78,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T09:55:00+00:00",
+                "findings": previous_findings,
+            },
+            head_sha="abcdef123456",
+        )
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report={
+                "id": 42,
+                "risk_score": 70,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T10:05:00+00:00",
+                "findings": current_findings,
+            },
+            previous_scan=previous_scan,
+        )
+
+        self.assertIn("Finding changes: 0 new / 1 resolved / 39 persistent", comment)
+        self.assertIn("Resolved finding: MEDIUM Persistent finding 8", comment)
 
     def test_build_pr_comment_hashes_long_existing_keys_without_prefix_collision(
         self,
@@ -747,6 +838,91 @@ class BuildPrCommentTests(unittest.TestCase):
         )
 
         self.assertIn("Finding changes: 1 new / 1 resolved / 1 persistent", comment)
+
+    def test_build_pr_comment_canonicalizes_evidence_refs_for_no_id_fallback(
+        self,
+    ) -> None:
+        share_summary = self._share_summary_payload()
+        previous_findings = [
+            {
+                "title": "Security group allows ingress",
+                "category": "network",
+                "evidence_refs": ["evidence-b", "evidence-a", "evidence-a"],
+                "severity": "high",
+            }
+        ]
+        current_findings = [
+            {
+                "title": "Security group allows ingress",
+                "category": "network",
+                "evidence_refs": ["evidence-a", "evidence-b"],
+                "severity": "high",
+            }
+        ]
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report={
+                "id": 42,
+                "risk_score": 88,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T10:05:00+00:00",
+                "findings": current_findings,
+            },
+            previous_scan={
+                "report_id": 41,
+                "risk_score": 78,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T09:55:00+00:00",
+                "findings": previous_findings,
+            },
+        )
+
+        self.assertIn("Finding changes: 0 new / 0 resolved / 1 persistent", comment)
+
+    def test_build_pr_comment_preserves_path_punctuation_in_no_id_fallback(
+        self,
+    ) -> None:
+        share_summary = self._share_summary_payload()
+        previous_findings = [
+            {
+                "title": "Security group allows ingress",
+                "category": "network",
+                "path": "env/prod.tf",
+                "severity": "high",
+            },
+            {
+                "title": "Security group allows ingress",
+                "category": "network",
+                "path": "env-prod.tf",
+                "severity": "high",
+            },
+        ]
+        current_findings = [previous_findings[1]]
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report={
+                "id": 42,
+                "risk_score": 88,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T10:05:00+00:00",
+                "findings": current_findings,
+            },
+            previous_scan={
+                "report_id": 41,
+                "risk_score": 78,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T09:55:00+00:00",
+                "findings": previous_findings,
+            },
+        )
+
+        self.assertIn("Finding changes: 0 new / 1 resolved / 1 persistent", comment)
 
     def test_build_pr_comment_keeps_hidden_metadata_within_comment_budget(self) -> None:
         share_summary = self._share_summary_payload()
