@@ -473,6 +473,229 @@ class BuildPrCommentTests(unittest.TestCase):
         self.assertIn("Finding changes: 1 new / 0 resolved / 13 persistent", comment)
         self.assertIn("New finding: HIGH New finding beyond", comment)
 
+    def test_build_pr_comment_counts_legacy_marker_findings_beyond_label_floor(
+        self,
+    ) -> None:
+        share_summary = self._share_summary_payload()
+        previous_findings = [
+            {
+                "title": f"Legacy finding {index}",
+                "severity": "medium",
+                "resource": f"aws_instance.legacy_{index}",
+            }
+            for index in range(8)
+        ]
+        current_findings = previous_findings + [
+            {
+                "title": "New finding after legacy marker",
+                "severity": "high",
+                "resource": "aws_security_group.new",
+            }
+        ]
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report={
+                "id": 42,
+                "risk_score": 88,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T10:05:00+00:00",
+                "findings": current_findings,
+            },
+            previous_scan={
+                "report_id": 41,
+                "risk_score": 78,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T09:55:00+00:00",
+                "findings": previous_findings,
+            },
+        )
+
+        self.assertIn("Finding changes: 1 new / 0 resolved / 8 persistent", comment)
+        self.assertIn("New finding: HIGH New finding after legac", comment)
+
+    def test_build_pr_comment_avoids_exact_delta_counts_for_capped_previous_marker(
+        self,
+    ) -> None:
+        share_summary = self._share_summary_payload()
+        previous_findings = [
+            {
+                "finding_id": f"finding-{index}",
+                "title": f"Persistent finding {index}",
+                "severity": "medium",
+            }
+            for index in range(40)
+        ]
+        previous_scan = action_runtime._current_scan_meta(
+            {
+                "id": 41,
+                "risk_score": 78,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T09:55:00+00:00",
+                "findings": previous_findings,
+            },
+            head_sha="abcdef123456",
+        )
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report={
+                "id": 42,
+                "risk_score": 88,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T10:05:00+00:00",
+                "findings": previous_findings
+                + [
+                    {
+                        "finding_id": "finding-new-forty-plus",
+                        "title": "New finding beyond capped previous marker",
+                        "severity": "high",
+                    }
+                ],
+            },
+            previous_scan=previous_scan,
+        )
+
+        self.assertIn("previous marker was capped", comment)
+        self.assertNotIn("9 new / 0 resolved / 32 persistent", comment)
+
+    def test_build_pr_comment_labels_resolved_finding_beyond_first_six(self) -> None:
+        share_summary = self._share_summary_payload()
+        previous_findings = [
+            {
+                "finding_id": f"finding-{index}",
+                "title": f"Persistent finding {index}",
+                "severity": "medium",
+            }
+            for index in range(10)
+        ]
+        current_findings = [
+            finding for index, finding in enumerate(previous_findings) if index != 8
+        ]
+        previous_scan = action_runtime._current_scan_meta(
+            {
+                "id": 41,
+                "risk_score": 78,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T09:55:00+00:00",
+                "findings": previous_findings,
+            },
+            head_sha="abcdef123456",
+        )
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report={
+                "id": 42,
+                "risk_score": 70,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T10:05:00+00:00",
+                "findings": current_findings,
+            },
+            previous_scan=previous_scan,
+        )
+
+        self.assertIn("Finding changes: 0 new / 1 resolved / 9 persistent", comment)
+        self.assertIn("Resolved finding: MEDIUM Persistent finding 8", comment)
+        self.assertNotIn("UNKNOWN Untitled finding", comment)
+
+    def test_build_pr_comment_hashes_long_existing_keys_without_prefix_collision(
+        self,
+    ) -> None:
+        share_summary = self._share_summary_payload()
+        first_key = "abcdefghijklmnop-first"
+        second_key = "abcdefghijklmnop-second"
+        previous_scan = {
+            "report_id": 41,
+            "risk_score": 78,
+            "severity": "high",
+            "recommendation": "no-go",
+            "created_at": "2026-04-23T09:55:00+00:00",
+            "finding_keys": [first_key, second_key],
+            "findings": [
+                {"key": first_key, "title": "First long key finding", "severity": "high"},
+                {"key": second_key, "title": "Second long key finding", "severity": "medium"},
+            ],
+        }
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report={
+                "id": 42,
+                "risk_score": 70,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T10:05:00+00:00",
+                "findings": [
+                    {
+                        "key": second_key,
+                        "title": "Second long key finding",
+                        "severity": "medium",
+                    }
+                ],
+            },
+            previous_scan=previous_scan,
+        )
+
+        self.assertIn("Finding changes: 0 new / 1 resolved / 1 persistent", comment)
+        self.assertIn("Resolved finding: HIGH First long key finding", comment)
+
+    def test_build_pr_comment_distinguishes_duplicate_no_id_findings_by_resource(
+        self,
+    ) -> None:
+        share_summary = self._share_summary_payload()
+        previous_findings = [
+            {
+                "title": "Security group allows ingress",
+                "category": "network",
+                "resource": "aws_security_group.api",
+                "severity": "high",
+            },
+            {
+                "title": "Security group allows ingress",
+                "category": "network",
+                "resource": "aws_security_group.worker",
+                "severity": "high",
+            },
+        ]
+        current_findings = [
+            previous_findings[1],
+            {
+                "title": "Security group allows ingress",
+                "category": "network",
+                "resource": "aws_security_group.admin",
+                "severity": "high",
+            },
+        ]
+
+        comment = action_runtime.build_pr_comment(
+            share_summary,
+            current_report={
+                "id": 42,
+                "risk_score": 88,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T10:05:00+00:00",
+                "findings": current_findings,
+            },
+            previous_scan={
+                "report_id": 41,
+                "risk_score": 78,
+                "severity": "high",
+                "recommendation": "no-go",
+                "created_at": "2026-04-23T09:55:00+00:00",
+                "findings": previous_findings,
+            },
+        )
+
+        self.assertIn("Finding changes: 1 new / 1 resolved / 1 persistent", comment)
+
     def test_build_pr_comment_keeps_hidden_metadata_within_comment_budget(self) -> None:
         share_summary = self._share_summary_payload()
         long_title = "very long finding title " * 140

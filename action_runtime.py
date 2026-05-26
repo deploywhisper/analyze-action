@@ -21,8 +21,9 @@ SCAN_META_MARKER = "deploywhisper:scan-meta"
 GITHUB_API_BASE_URL = "https://api.github.com"
 MAX_PR_COMMENT_LENGTH = 2000
 SCAN_META_KEY_LIMIT = 32
-SCAN_META_LABEL_LIMIT = 6
+SCAN_META_LABEL_LIMIT = 12
 SCAN_META_KEY_LENGTH = 16
+SCAN_META_MARKER_LENGTH_LIMIT = 1200
 SENSITIVE_FILE_MARKERS = {
     ".env",
     ".pem",
@@ -512,16 +513,20 @@ def extract_comment_metadata(comment_body: str) -> dict[str, object] | None:
         risk_score = _scan_meta_int(payload, "risk_score")
         if report_id <= 0 or risk_score < 0:
             return None
-        findings = _scan_meta_findings(payload.get("findings"))
-        finding_keys = (
-            [
-                _scan_meta_text(item, SCAN_META_KEY_LENGTH)
-                for item in payload.get("finding_keys", [])
-                if _scan_meta_text(item, SCAN_META_KEY_LENGTH)
+        raw_findings = payload.get("findings")
+        findings = _scan_meta_findings(raw_findings)
+        raw_finding_keys = payload.get("finding_keys")
+        if isinstance(raw_finding_keys, list):
+            finding_keys = [
+                key
+                for raw_key in raw_finding_keys
+                if (key := _finding_identity_key({"key": raw_key}))
             ]
-            if isinstance(payload.get("finding_keys"), list)
-            else [item["key"] for item in findings]
-        )
+        else:
+            finding_keys, _, _ = _scan_meta_finding_keys(
+                raw_findings,
+                limit=len(_dict_items(raw_findings)),
+            )
         return {
             "report_id": report_id,
             "risk_score": risk_score,
@@ -533,6 +538,7 @@ def extract_comment_metadata(comment_body: str) -> dict[str, object] | None:
             "findings": findings,
             "findings_total": _safe_int(payload.get("findings_total"), len(finding_keys)),
             "findings_truncated": bool(payload.get("findings_truncated")),
+            "finding_labels_truncated": bool(payload.get("finding_labels_truncated")),
         }
     except (KeyError, TypeError, ValueError):
         return None
@@ -555,11 +561,28 @@ def _current_scan_meta(
         scan_meta["head_sha"] = head_sha
     if finding_keys:
         scan_meta["finding_keys"] = finding_keys
-        scan_meta["findings"] = _scan_meta_findings(current_report.get("findings"))
+        label_limit = len(finding_keys) if len(finding_keys) <= SCAN_META_LABEL_LIMIT else 0
+        findings = _scan_meta_findings(current_report.get("findings"), limit=label_limit)
+        if findings:
+            scan_meta["findings"] = findings
+        if len(findings) < len(finding_keys):
+            scan_meta["finding_labels_truncated"] = True
     if findings_truncated:
         scan_meta["findings_total"] = findings_total
         scan_meta["findings_truncated"] = True
+    _shrink_scan_meta_labels(scan_meta)
     return scan_meta
+
+
+def _shrink_scan_meta_labels(scan_meta: dict[str, object]) -> None:
+    findings = scan_meta.get("findings")
+    if not isinstance(findings, list):
+        return
+    while findings and len(_scan_meta_marker(scan_meta)) > SCAN_META_MARKER_LENGTH_LIMIT:
+        findings.pop()
+        scan_meta["finding_labels_truncated"] = True
+    if not findings:
+        scan_meta.pop("findings", None)
 
 
 def _nonblank_string(value: object) -> str:
@@ -668,7 +691,9 @@ def _finding_severity(finding: dict[str, object]) -> str:
 def _finding_identity_key(finding: dict[str, object]) -> str:
     existing_key = _nonblank_string(finding.get("key"))
     if existing_key:
-        return _scan_meta_text(existing_key, SCAN_META_KEY_LENGTH)
+        if re.fullmatch(r"[a-f0-9]{16}", existing_key):
+            return existing_key
+        return _compact_finding_key(f"key:{existing_key}")
     for field_name in ("finding_id", "id"):
         stable_id = _nonblank_string(finding.get(field_name))
         if stable_id:
@@ -680,8 +705,34 @@ def _finding_identity_key(finding: dict[str, object]) -> str:
         _nonblank_string(finding.get("category"))
         or _nonblank_string(finding.get("resource_category"))
     )
-    identity = f"{category}|{title}".lower()
+    discriminator = _finding_discriminator(finding)
+    identity = f"{category}|{title}|{discriminator}".lower()
     return _compact_finding_key(re.sub(r"[^a-z0-9]+", " ", identity).strip())
+
+
+def _finding_discriminator(finding: dict[str, object]) -> str:
+    for field_name in (
+        "resource",
+        "resource_id",
+        "resource_name",
+        "resource_address",
+        "address",
+        "target",
+        "location",
+        "path",
+        "file",
+        "filename",
+        "line",
+        "service",
+        "name",
+    ):
+        value = _nonblank_string(finding.get(field_name))
+        if value:
+            return value
+    evidence_refs = finding.get("evidence_refs")
+    if isinstance(evidence_refs, list):
+        return "|".join(_nonblank_string(item) for item in evidence_refs if item)
+    return ""
 
 
 def _scan_meta_findings(
@@ -735,9 +786,9 @@ def _finding_lookup(value: object) -> dict[str, dict[str, str]] | None:
         if isinstance(raw_keys, list):
             lookup: dict[str, dict[str, str]] = {}
             for raw_key in raw_keys:
-                key = _scan_meta_text(raw_key, SCAN_META_KEY_LENGTH)
+                key = _finding_identity_key({"key": raw_key})
                 if key:
-                    lookup[key] = labels.get(key, {"key": key, "severity": "unknown"})
+                    lookup[key] = labels.get(key, {"key": key})
             return lookup
         if "findings" in value:
             return labels
@@ -776,12 +827,23 @@ def _finding_label(finding: dict[str, str], *, limit: int) -> str:
     return f"{severity} {title}"
 
 
+def _finding_has_label(finding: dict[str, str]) -> bool:
+    return bool(_nonblank_string(finding.get("title")))
+
+
 def _finding_delta_lines(
     previous_scan: dict[str, object] | None,
     current_report: dict[str, object] | None,
     *,
     limit: int,
 ) -> list[str]:
+    if isinstance(previous_scan, dict) and bool(previous_scan.get("findings_truncated")):
+        return [
+            (
+                "- Finding changes: previous marker was capped; exact new / resolved / "
+                "persistent counts are unavailable."
+            )
+        ]
     delta = _finding_delta(previous_scan, current_report)
     if not any(delta.values()):
         return []
@@ -803,8 +865,9 @@ def _finding_delta_lines(
         ("Persistent finding", delta["persistent"]),
     )
     for label, findings in examples:
-        if findings:
-            lines.append(f"- {label}: {_finding_label(findings[0], limit=limit)}")
+        finding = next((item for item in findings if _finding_has_label(item)), None)
+        if finding:
+            lines.append(f"- {label}: {_finding_label(finding, limit=limit)}")
     return lines
 
 
