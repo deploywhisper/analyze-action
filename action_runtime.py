@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import UTC, datetime
+import hashlib
 import json
 import math
 import os
@@ -18,6 +19,17 @@ import uuid
 COMMENT_MARKER = "<!-- deploywhisper:pr-comment -->"
 SCAN_META_MARKER = "deploywhisper:scan-meta"
 GITHUB_API_BASE_URL = "https://api.github.com"
+MAX_PR_COMMENT_LENGTH = 2000
+SCAN_META_KEY_LIMIT = 88
+SCAN_META_LABEL_LIMIT = 32
+SCAN_META_KEY_LENGTH = 16
+SCAN_META_MARKER_LENGTH_LIMIT = 1600
+DELTA_LINE_PREFIXES = (
+    "- Finding changes:",
+    "- New finding:",
+    "- Resolved finding:",
+    "- Persistent finding:",
+)
 SENSITIVE_FILE_MARKERS = {
     ".env",
     ".pem",
@@ -45,6 +57,84 @@ def _shorten(text: str, limit: int) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: max(limit - 1, 0)].rstrip() + "…"
+
+
+def _shorten_preserve_tail(text: str, limit: int) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= limit:
+        return normalized
+    if limit <= 1:
+        return "…"[:limit]
+    separator = " … "
+    if limit <= len(separator) + 2:
+        return _shorten(normalized, limit)
+    head_length = max((limit - len(separator)) // 2, 1)
+    tail_length = max(limit - len(separator) - head_length, 1)
+    return (
+        normalized[:head_length].rstrip()
+        + separator
+        + normalized[-tail_length:].lstrip()
+    )
+
+
+def _prioritize_delta_lines(text: str) -> str:
+    lines = text.splitlines()
+    delta_lines = [
+        line
+        for line in lines
+        if any(line.startswith(prefix) for prefix in DELTA_LINE_PREFIXES)
+    ]
+    if not delta_lines:
+        return text
+    remaining = [line for line in lines if line not in delta_lines]
+    insert_index = min(3, len(remaining))
+    return "\n".join(remaining[:insert_index] + delta_lines + remaining[insert_index:])
+
+
+def _compact_opening_with_delta_lines(text: str, limit: int) -> str | None:
+    lines = text.splitlines()
+    delta_lines = [
+        line
+        for line in lines
+        if any(line.startswith(prefix) for prefix in DELTA_LINE_PREFIXES)
+    ]
+    if not delta_lines:
+        return None
+
+    prefix: list[str] = []
+    for line in lines:
+        if (
+            line == COMMENT_MARKER
+            or line.startswith("## ")
+            or line.startswith("**Summary:**")
+        ):
+            prefix.append(line)
+        if len(prefix) >= 3:
+            break
+    detail_lines = (
+        ["<details>", "<summary>Top risks and evidence</summary>", ""]
+        if "<details>" in lines
+        else []
+    )
+    compact_lines = prefix + delta_lines + detail_lines
+    compact = "\n".join(compact_lines)
+    if len(compact) <= limit:
+        return compact
+
+    compact_lines = [
+        _shorten(line, 72) if line.startswith("**Summary:**") else line
+        for line in compact_lines
+    ]
+    compact = "\n".join(compact_lines)
+    if len(compact) <= limit:
+        return compact
+
+    compact = "\n".join(
+        [line for line in compact_lines if not line.startswith("**Summary:**")]
+    )
+    if len(compact) <= limit:
+        return compact
+    return None
 
 
 def _format_timestamp(value: str | None) -> str:
@@ -507,6 +597,14 @@ def extract_comment_metadata(comment_body: str) -> dict[str, object] | None:
         risk_score = _scan_meta_int(payload, "risk_score")
         if report_id <= 0 or risk_score < 0:
             return None
+        raw_findings = payload.get("findings")
+        findings = _scan_meta_findings(raw_findings)
+        finding_keys = _scan_meta_finding_keys_from_payload(payload)
+        if finding_keys is None:
+            finding_keys, _, _ = _scan_meta_finding_keys(
+                raw_findings,
+                limit=len(_dict_items(raw_findings)),
+            )
         return {
             "report_id": report_id,
             "risk_score": risk_score,
@@ -514,7 +612,11 @@ def extract_comment_metadata(comment_body: str) -> dict[str, object] | None:
             "recommendation": str(payload.get("recommendation") or "").lower(),
             "created_at": str(payload.get("created_at") or ""),
             "head_sha": str(payload.get("head_sha") or ""),
-            "findings": _scan_meta_findings(payload.get("findings")),
+            "finding_keys": finding_keys,
+            "findings": findings,
+            "findings_total": _safe_int(payload.get("findings_total"), len(finding_keys)),
+            "findings_truncated": payload.get("findings_truncated") is True,
+            "finding_labels_truncated": payload.get("finding_labels_truncated") is True,
         }
     except (KeyError, TypeError, ValueError):
         return None
@@ -523,15 +625,79 @@ def extract_comment_metadata(comment_body: str) -> dict[str, object] | None:
 def _current_scan_meta(
     current_report: dict[str, object], *, head_sha: str | None
 ) -> dict[str, object]:
-    return {
+    finding_keys, findings_total, findings_truncated = _scan_meta_finding_keys(
+        current_report.get("findings")
+    )
+    scan_meta = {
         "report_id": _safe_int(current_report.get("id")),
         "risk_score": _safe_int(current_report.get("risk_score")),
         "severity": str(current_report.get("severity") or "").lower(),
         "recommendation": str(current_report.get("recommendation") or "").lower(),
         "created_at": str(current_report.get("created_at") or ""),
-        "head_sha": head_sha or "",
-        "findings": _scan_meta_findings(current_report.get("findings")),
     }
+    if head_sha:
+        scan_meta["head_sha"] = head_sha
+    if finding_keys:
+        scan_meta["finding_keyset"] = _pack_finding_keys(finding_keys)
+        label_limit = min(len(finding_keys), SCAN_META_LABEL_LIMIT)
+        findings = _scan_meta_findings(current_report.get("findings"), limit=label_limit)
+        if findings:
+            scan_meta["findings"] = findings
+        if len(findings) < len(finding_keys):
+            scan_meta["finding_labels_truncated"] = True
+    if findings_truncated:
+        scan_meta["findings_total"] = findings_total
+        scan_meta["findings_truncated"] = True
+    _shrink_scan_meta_labels(scan_meta)
+    return scan_meta
+
+
+def _shrink_scan_meta_labels(scan_meta: dict[str, object]) -> None:
+    findings = scan_meta.get("findings")
+    if not isinstance(findings, list):
+        return
+    while findings and len(_scan_meta_marker(scan_meta)) > SCAN_META_MARKER_LENGTH_LIMIT:
+        findings.pop()
+        scan_meta["finding_labels_truncated"] = True
+    if not findings:
+        scan_meta.pop("findings", None)
+
+
+def _pack_finding_keys(keys: list[str]) -> str:
+    return "".join(key for key in keys if re.fullmatch(r"[a-f0-9]{16}", key))
+
+
+def _unpack_finding_keyset(value: object) -> list[str] | None:
+    if not isinstance(value, str):
+        return None
+    keyset = value.strip().lower()
+    if not keyset:
+        return []
+    if len(keyset) % SCAN_META_KEY_LENGTH != 0:
+        return None
+    if not re.fullmatch(r"[a-f0-9]+", keyset):
+        return None
+    return [
+        keyset[index : index + SCAN_META_KEY_LENGTH]
+        for index in range(0, len(keyset), SCAN_META_KEY_LENGTH)
+    ]
+
+
+def _scan_meta_finding_keys_from_payload(payload: dict[str, object]) -> list[str] | None:
+    compact_keys = _unpack_finding_keyset(payload.get("finding_keyset"))
+    if compact_keys is not None:
+        return compact_keys
+    raw_keys = payload.get("finding_keys")
+    if not isinstance(raw_keys, list):
+        return None
+    keys: list[str] = []
+    seen: set[str] = set()
+    for raw_key in raw_keys:
+        key = _finding_identity_key({"key": raw_key})
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+    return keys
 
 
 def _nonblank_string(value: object) -> str:
@@ -617,6 +783,11 @@ def _scan_meta_text(value: object, limit: int) -> str:
     )
 
 
+def _compact_finding_key(value: str) -> str:
+    normalized = " ".join(value.lower().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:SCAN_META_KEY_LENGTH]
+
+
 def _finding_title(finding: dict[str, object]) -> str:
     return (
         _nonblank_string(finding.get("title"))
@@ -635,7 +806,13 @@ def _finding_severity(finding: dict[str, object]) -> str:
 def _finding_identity_key(finding: dict[str, object]) -> str:
     existing_key = _nonblank_string(finding.get("key"))
     if existing_key:
-        return existing_key
+        if re.fullmatch(r"[a-f0-9]{16}", existing_key):
+            return existing_key
+        return _compact_finding_key(f"key:{existing_key}")
+    for field_name in ("finding_id", "id"):
+        stable_id = _nonblank_string(finding.get(field_name))
+        if stable_id:
+            return _compact_finding_key(f"{field_name}:{stable_id}")
     title = _finding_title(finding)
     if not title:
         return ""
@@ -643,11 +820,53 @@ def _finding_identity_key(finding: dict[str, object]) -> str:
         _nonblank_string(finding.get("category"))
         or _nonblank_string(finding.get("resource_category"))
     )
-    identity = f"{category}|{title}".lower()
-    return re.sub(r"[^a-z0-9]+", " ", identity).strip()
+    discriminator = _finding_discriminator(finding)
+    identity = {
+        "category": _single_line_string(category).lower(),
+        "title": _single_line_string(title).lower(),
+        "discriminator": discriminator.lower(),
+    }
+    return _compact_finding_key(json.dumps(identity, separators=(",", ":"), sort_keys=True))
 
 
-def _scan_meta_findings(value: object, *, limit: int = 12) -> list[dict[str, str]]:
+def _finding_discriminator(finding: dict[str, object]) -> str:
+    values: list[str] = []
+    for field_name in (
+        "resource",
+        "resource_id",
+        "resource_name",
+        "resource_address",
+        "address",
+        "target",
+        "location",
+        "path",
+        "file",
+        "filename",
+        "line",
+        "service",
+        "name",
+    ):
+        value = _nonblank_string(finding.get(field_name))
+        if value:
+            values.append(f"{field_name}:{value}")
+    evidence_refs = finding.get("evidence_refs")
+    if isinstance(evidence_refs, list):
+        values.extend(
+            f"evidence:{item_value}"
+            for item_value in sorted(
+                {
+                    _single_line_string(item).lower()
+                    for item in evidence_refs
+                    if _single_line_string(item)
+                }
+            )
+        )
+    return "|".join(values)
+
+
+def _scan_meta_findings(
+    value: object, *, limit: int = SCAN_META_LABEL_LIMIT
+) -> list[dict[str, str]]:
     findings: list[dict[str, str]] = []
     seen: set[str] = set()
     for raw_finding in _dict_items(value):
@@ -662,18 +881,52 @@ def _scan_meta_findings(value: object, *, limit: int = 12) -> list[dict[str, str
             {
                 "key": key,
                 "severity": _scan_meta_text(_finding_severity(raw_finding), 16),
-                "title": _scan_meta_text(title, 96),
+                "title": _scan_meta_text(title, 72),
             }
         )
     return findings
 
 
-def _finding_lookup(value: object) -> dict[str, dict[str, str]]:
-    return {
-        item["key"]: item
-        for item in _scan_meta_findings(value)
-        if _nonblank_string(item.get("key"))
-    }
+def _scan_meta_finding_keys(
+    value: object, *, limit: int = SCAN_META_KEY_LIMIT
+) -> tuple[list[str], int, bool]:
+    keys: list[str] = []
+    seen: set[str] = set()
+    total = 0
+    for raw_finding in _dict_items(value):
+        key = _finding_identity_key(raw_finding)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        total += 1
+        if len(keys) < limit:
+            keys.append(key)
+    return keys, total, total > len(keys)
+
+
+def _finding_lookup(value: object) -> dict[str, dict[str, str]] | None:
+    if isinstance(value, dict):
+        keys = _scan_meta_finding_keys_from_payload(value)
+        labels = {
+            item["key"]: item
+            for item in _scan_meta_findings(value.get("findings"))
+            if _nonblank_string(item.get("key"))
+        }
+        if keys is not None:
+            lookup: dict[str, dict[str, str]] = {}
+            for key in keys:
+                lookup[key] = labels.get(key, {"key": key})
+            return lookup
+        if "findings" in value:
+            return labels
+        return None
+    if isinstance(value, list):
+        return {
+            item["key"]: item
+            for item in _scan_meta_findings(value, limit=len(value))
+            if _nonblank_string(item.get("key"))
+        }
+    return None
 
 
 def _finding_delta(
@@ -682,9 +935,9 @@ def _finding_delta(
 ) -> dict[str, list[dict[str, str]]]:
     if not previous_scan or not current_report:
         return {"new": [], "resolved": [], "persistent": []}
-    previous = _finding_lookup(previous_scan.get("findings"))
+    previous = _finding_lookup(previous_scan)
     current = _finding_lookup(current_report.get("findings"))
-    if not previous or not current:
+    if previous is None or current is None:
         return {"new": [], "resolved": [], "persistent": []}
     previous_keys = set(previous)
     current_keys = set(current)
@@ -701,20 +954,36 @@ def _finding_label(finding: dict[str, str], *, limit: int) -> str:
     return f"{severity} {title}"
 
 
+def _finding_has_label(finding: dict[str, str]) -> bool:
+    return bool(_nonblank_string(finding.get("title")))
+
+
 def _finding_delta_lines(
     previous_scan: dict[str, object] | None,
     current_report: dict[str, object] | None,
     *,
     limit: int,
 ) -> list[str]:
+    if isinstance(previous_scan, dict) and bool(previous_scan.get("findings_truncated")):
+        return [
+            (
+                "- Finding changes: previous marker was capped; exact new / resolved / "
+                "persistent counts are unavailable."
+            )
+        ]
     delta = _finding_delta(previous_scan, current_report)
     if not any(delta.values()):
         return []
+    partial = (
+        isinstance(previous_scan, dict)
+        and bool(previous_scan.get("findings_truncated"))
+    )
+    partial_note = " (partial; previous marker capped)" if partial else ""
     lines = [
         (
             "- Finding changes: "
             f"{len(delta['new'])} new / {len(delta['resolved'])} resolved / "
-            f"{len(delta['persistent'])} persistent"
+            f"{len(delta['persistent'])} persistent{partial_note}"
         )
     ]
     examples = (
@@ -723,8 +992,9 @@ def _finding_delta_lines(
         ("Persistent finding", delta["persistent"]),
     )
     for label, findings in examples:
-        if findings:
-            lines.append(f"- {label}: {_finding_label(findings[0], limit=limit)}")
+        finding = next((item for item in findings if _finding_has_label(item)), None)
+        if finding:
+            lines.append(f"- {label}: {_finding_label(finding, limit=limit)}")
     return lines
 
 
@@ -1155,7 +1425,7 @@ def build_pr_comment(
         ),
     ]
     for comment in candidates:
-        if len(comment) <= 2000:
+        if len(comment) <= MAX_PR_COMMENT_LENGTH:
             return comment
 
     fallback = _render_pr_comment(
@@ -1169,7 +1439,7 @@ def build_pr_comment(
         compact_links=True,
         compact_context=True,
     )
-    if len(fallback) <= 2000:
+    if len(fallback) <= MAX_PR_COMMENT_LENGTH:
         return fallback
     meta_prefix = f"\n<!-- {SCAN_META_MARKER} "
     meta_suffix = ""
@@ -1180,8 +1450,14 @@ def build_pr_comment(
     closing = "\n</details>"
     opening, _, _ = fallback.rpartition(closing)
     reserved = len(closing) + len(meta_suffix) + 8
-    available = max(2000 - reserved, 64)
-    return _shorten(opening, available).rstrip() + closing + meta_suffix
+    available = MAX_PR_COMMENT_LENGTH - reserved
+    if available < 64:
+        return _shorten(fallback, MAX_PR_COMMENT_LENGTH)
+    compact_opening = _compact_opening_with_delta_lines(opening, available)
+    if compact_opening is not None:
+        return compact_opening.rstrip() + closing + meta_suffix
+    opening = _prioritize_delta_lines(opening)
+    return _shorten_preserve_tail(opening, available).rstrip() + closing + meta_suffix
 
 
 def _find_existing_pr_comment(
