@@ -370,6 +370,42 @@ class UpsertPrCommentTests(unittest.TestCase):
 
         self.assertIsNone(metadata)
 
+    def test_extract_comment_metadata_ignores_boolean_scan_marker_ids(self) -> None:
+        for marker in (
+            '{"report_id":true,"risk_score":78,"severity":"high"}',
+            '{"report_id":41,"risk_score":false,"severity":"high"}',
+        ):
+            with self.subTest(marker=marker):
+                body = "\n".join(
+                    [
+                        "<!-- deploywhisper:pr-comment -->",
+                        f"<!-- deploywhisper:scan-meta {marker} -->",
+                        "existing body",
+                    ]
+                )
+
+                metadata = action_runtime.extract_comment_metadata(body)
+
+                self.assertIsNone(metadata)
+
+    def test_extract_comment_metadata_ignores_float_scan_marker_ids(self) -> None:
+        for marker in (
+            '{"report_id":41.7,"risk_score":78,"severity":"high"}',
+            '{"report_id":41,"risk_score":78.9,"severity":"high"}',
+        ):
+            with self.subTest(marker=marker):
+                body = "\n".join(
+                    [
+                        "<!-- deploywhisper:pr-comment -->",
+                        f"<!-- deploywhisper:scan-meta {marker} -->",
+                        "existing body",
+                    ]
+                )
+
+                metadata = action_runtime.extract_comment_metadata(body)
+
+                self.assertIsNone(metadata)
+
 
 class SubmitAnalysisTests(unittest.TestCase):
     def test_submit_analysis_maps_scope_inputs_to_multipart_fields(self) -> None:

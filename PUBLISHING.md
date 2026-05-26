@@ -33,17 +33,18 @@ for example `deploywhisper/analyze-action`.
 ## Marketplace release
 
 1. Merge the tested branch in the dedicated public action repository.
-2. Create and push an immutable semantic version tag, for example:
+2. Create and push an immutable semantic version tag, replacing
+   `<new-version>` with the version being published:
 
    ```bash
-   git tag -a v1.0.1 -m "DeployWhisper Analyze Action v1.0.1"
-   git push origin v1.0.1
+   git tag -a <new-version> -m "DeployWhisper Analyze Action <new-version>"
+   git push origin <new-version>
    ```
 
 3. Smoke the immutable tag from the separate consumer repository:
 
    ```yaml
-   - uses: deploywhisper/analyze-action@v1.0.1
+   - uses: deploywhisper/analyze-action@<new-version>
    ```
 
    The `deploywhisper/action-smoke-consumer` workflow keeps this immutable
@@ -53,7 +54,7 @@ for example `deploywhisper/analyze-action`.
 4. Move the major compatibility tag to the same reviewed commit:
 
    ```bash
-   git tag -f v1 v1.0.1
+   git tag -f v1 <new-version>
    git push origin v1 --force
    ```
 

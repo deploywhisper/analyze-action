@@ -476,6 +476,17 @@ def _scan_meta_marker(scan_meta: dict[str, object]) -> str:
     return f"<!-- {SCAN_META_MARKER} {json.dumps(scan_meta, separators=(',', ':'))} -->"
 
 
+def _scan_meta_int(payload: dict[str, object], key: str) -> int:
+    value = payload[key]
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be an integer.")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        return int(value.strip())
+    raise ValueError(f"{key} must be an integer.")
+
+
 def extract_comment_metadata(comment_body: str) -> dict[str, object] | None:
     match = re.search(
         r"<!--\s*deploywhisper:scan-meta\s+(\{.*?\})\s*-->",
@@ -491,8 +502,8 @@ def extract_comment_metadata(comment_body: str) -> dict[str, object] | None:
     if not isinstance(payload, dict):
         return None
     try:
-        report_id = int(payload["report_id"])
-        risk_score = int(payload["risk_score"])
+        report_id = _scan_meta_int(payload, "report_id")
+        risk_score = _scan_meta_int(payload, "risk_score")
         if report_id <= 0 or risk_score < 0:
             return None
         return {
