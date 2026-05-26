@@ -295,9 +295,20 @@ def _resolve_analysis_endpoint(api_url: str) -> str:
     )
 
 
-def _multipart_body(files: list[tuple[str, bytes]]) -> tuple[bytes, str]:
+def _multipart_body(
+    files: list[tuple[str, bytes]], fields: dict[str, str] | None = None
+) -> tuple[bytes, str]:
     boundary = f"deploywhisper-{uuid.uuid4().hex}"
     body = bytearray()
+    for name, value in (fields or {}).items():
+        if value == "":
+            continue
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8")
+        )
+        body.extend(value.encode("utf-8"))
+        body.extend(b"\r\n")
     for filename, content in files:
         body.extend(f"--{boundary}\r\n".encode("utf-8"))
         disposition = (
@@ -330,6 +341,62 @@ def _http_json(request_obj: request.Request) -> dict:
         raise ActionRuntimeError(
             "DeployWhisper API returned a non-JSON response."
         ) from exc
+
+
+def _truthy_input(value: object) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def validate_scope_inputs(
+    *,
+    project_key: str | None,
+    project_id: str | None,
+    workspace_key: str | None,
+    workspace_id: str | None,
+    allow_derived_project_scope: bool,
+) -> dict[str, str]:
+    project_key = (project_key or "").strip()
+    project_id = (project_id or "").strip()
+    workspace_key = (workspace_key or "").strip()
+    workspace_id = (workspace_id or "").strip()
+
+    for label, value in {
+        "project-key": project_key,
+        "project-id": project_id,
+        "workspace-key": workspace_key,
+        "workspace-id": workspace_id,
+    }.items():
+        if "\r" in value or "\n" in value:
+            raise ActionRuntimeError(f"{label} must not contain newline characters.")
+
+    for label, value in {
+        "project-id": project_id,
+        "workspace-id": workspace_id,
+    }.items():
+        if value and not re.fullmatch(r"[1-9][0-9]*", value):
+            raise ActionRuntimeError(f"{label} must be a positive numeric id.")
+
+    if project_key and project_id:
+        raise ActionRuntimeError(
+            "Provide only one project scope input: project-key or project-id."
+        )
+    if workspace_key and workspace_id:
+        raise ActionRuntimeError(
+            "Provide only one workspace scope input: workspace-key or workspace-id."
+        )
+    if not project_key and not project_id and not allow_derived_project_scope:
+        raise ActionRuntimeError(
+            "Project scope is required. Provide project-key or project-id, "
+            "or set allow-derived-project-scope to true when the API endpoint "
+            "derives project scope."
+        )
+
+    return {
+        "project_key": project_key,
+        "project_id": project_id,
+        "workspace_key": workspace_key,
+        "workspace_id": workspace_id,
+    }
 
 
 def _github_api_json(
@@ -371,12 +438,22 @@ def submit_analysis(
     artifacts: list[tuple[str, bytes]],
     *,
     api_token: str | None,
+    project_key: str | None = None,
+    project_id: str | None = None,
+    workspace_key: str | None = None,
+    workspace_id: str | None = None,
     trigger_type: str,
     trigger_id: str,
 ) -> dict:
     """POST artifacts to the existing analyses API."""
     endpoint = _resolve_analysis_endpoint(api_url)
-    body, boundary = _multipart_body(artifacts)
+    scope_fields = {
+        "project_key": (project_key or "").strip(),
+        "project_id": (project_id or "").strip(),
+        "workspace_key": (workspace_key or "").strip(),
+        "workspace_id": (workspace_id or "").strip(),
+    }
+    body, boundary = _multipart_body(artifacts, scope_fields)
     headers = {
         "Accept": "application/json",
         "Content-Type": f"multipart/form-data; boundary={boundary}",
@@ -816,6 +893,17 @@ def _build_trigger_id(context: dict[str, object]) -> str:
     return f"github@{sha_fragment}"
 
 
+def _build_trigger_type(context: dict[str, object]) -> str:
+    event_name = str(context.get("event_name") or "").strip()
+    if event_name == "pull_request":
+        return "github_pull_request"
+    if event_name == "pull_request_target":
+        return "github_pull_request_target"
+    if event_name:
+        return f"github_{event_name}"
+    return "github_action"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the DeployWhisper GitHub Action.")
     parser.add_argument(
@@ -827,6 +915,37 @@ def build_parser() -> argparse.ArgumentParser:
         "--api-token",
         default="",
         help="Optional bearer token for the DeployWhisper API.",
+    )
+    parser.add_argument(
+        "--project-key",
+        default="",
+        help=(
+            "Project key for DeployWhisper project-scoped analysis. "
+            "Leave blank only when the API endpoint derives project scope."
+        ),
+    )
+    parser.add_argument(
+        "--project-id",
+        default="",
+        help="Numeric project id for DeployWhisper project-scoped analysis.",
+    )
+    parser.add_argument(
+        "--workspace-key",
+        default="",
+        help="Optional workspace or environment key within the selected project.",
+    )
+    parser.add_argument(
+        "--workspace-id",
+        default="",
+        help="Optional numeric workspace or environment id within the selected project.",
+    )
+    parser.add_argument(
+        "--allow-derived-project-scope",
+        default="true",
+        help=(
+            "Set true only when the DeployWhisper API endpoint derives project "
+            "scope without a project-key or project-id input."
+        ),
     )
     parser.add_argument(
         "--changed-files",
@@ -875,16 +994,31 @@ def run_action(args: argparse.Namespace, environ: dict[str, str] | None = None) 
         )
         return 0
 
+    scope_fields = validate_scope_inputs(
+        project_key=args.project_key,
+        project_id=args.project_id,
+        workspace_key=args.workspace_key,
+        workspace_id=args.workspace_id,
+        allow_derived_project_scope=_truthy_input(
+            getattr(args, "allow_derived_project_scope", "")
+        ),
+    )
+
     payload = submit_analysis(
         args.api_url,
         upload_files,
         api_token=args.api_token or None,
-        trigger_type="github_pull_request",
+        project_key=scope_fields["project_key"] or None,
+        project_id=scope_fields["project_id"] or None,
+        workspace_key=scope_fields["workspace_key"] or None,
+        workspace_id=scope_fields["workspace_id"] or None,
+        trigger_type=_build_trigger_type(context),
         trigger_id=_build_trigger_id(context),
     )
 
     data = dict(payload.get("data") or {})
     meta = dict(payload.get("meta") or {})
+    advisory = dict(data.get("advisory") or {})
     share_summary = dict(data.get("share_summary") or {})
     share_json = dict(share_summary.get("json_payload") or {})
     persisted_report = dict(data.get("persisted_report") or {})
@@ -897,8 +1031,16 @@ def run_action(args: argparse.Namespace, environ: dict[str, str] | None = None) 
     )
     write_github_output("report-id", persisted_report.get("id", ""), env)
     write_github_output("report-link", share_json.get("report_link", ""), env)
-    write_github_output("severity", share_summary.get("severity", ""), env)
-    write_github_output("recommendation", share_summary.get("recommendation", ""), env)
+    write_github_output(
+        "severity",
+        advisory.get("severity") or share_summary.get("severity", ""),
+        env,
+    )
+    write_github_output(
+        "recommendation",
+        advisory.get("recommendation") or share_summary.get("recommendation", ""),
+        env,
+    )
     write_github_output("share-summary-json", share_json, env)
     write_github_output(
         "share-summary-markdown", share_summary.get("markdown", ""), env

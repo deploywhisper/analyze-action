@@ -19,6 +19,8 @@ for example `deploywhisper/analyze-action`.
    - uses: <owner>/<repo>@<branch-or-tag>
      with:
        api-url: ${{ secrets.DEPLOYWHISPER_API_URL }}
+       project-key: ${{ secrets.DEPLOYWHISPER_PROJECT_KEY }}
+       workspace-key: ${{ secrets.DEPLOYWHISPER_WORKSPACE_KEY }}
    ```
 
 3. Confirm the job:

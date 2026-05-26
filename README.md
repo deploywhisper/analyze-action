@@ -33,11 +33,16 @@ jobs:
       - uses: deploywhisper/analyze-action@v1
         with:
           api-url: ${{ secrets.DEPLOYWHISPER_API_URL }}
+          project-key: payments
+          workspace-key: prod
 ```
 
-Optional inputs:
+Required and optional inputs:
 
 - `api-token`
+- `project-key` or `project-id`: required for normal project-scoped analysis unless your DeployWhisper endpoint derives project scope from repository context
+- `workspace-key` or `workspace-id`: optional project-local environment or deployment lane
+- `allow-derived-project-scope`: defaults to `true` for v1 compatibility with endpoints that derive project scope; set to `false` to fail fast when `project-key` or `project-id` is missing
 - `changed-files`
 - `working-directory`
 
@@ -62,7 +67,7 @@ Outputs:
 
 - detects changed files from the pull-request diff
 - filters to supported DeployWhisper artifacts locally before upload
-- submits those artifacts to `POST /api/v1/analyses`
+- submits those artifacts to `POST /api/v1/analyses` with explicit project and optional workspace scope when configured
 - posts a single markdown PR comment and updates that same comment on re-runs
 - compares the latest report with the previous PR scan so the updated comment shows score and severity changes
 - exits `0` when analysis succeeds, regardless of risk verdict

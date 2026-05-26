@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from urllib import parse
 import sys
 import tempfile
 import unittest
@@ -245,7 +246,8 @@ class UpsertPrCommentTests(unittest.TestCase):
         def fake_urlopen(request_obj, timeout=120):
             requests.append((request_obj.get_method(), request_obj.full_url))
             if request_obj.get_method() == "GET":
-                if "page=1" in request_obj.full_url:
+                query = parse.parse_qs(parse.urlparse(request_obj.full_url).query)
+                if query.get("page") == ["1"]:
                     return self._response(
                         [
                             {
@@ -302,6 +304,162 @@ class UpsertPrCommentTests(unittest.TestCase):
         self.assertEqual(metadata["head_sha"], "abcdef123456")
 
 
+class SubmitAnalysisTests(unittest.TestCase):
+    def test_submit_analysis_maps_scope_inputs_to_multipart_fields(self) -> None:
+        captured = {}
+
+        def fake_http_json(request_obj):
+            captured["url"] = request_obj.full_url
+            captured["body"] = request_obj.data.decode("utf-8")
+            captured["content_type"] = request_obj.headers["Content-type"]
+            captured["authorization"] = request_obj.headers["Authorization"]
+            return {"data": {"persisted_report": {"id": 42}}}
+
+        with patch("action_runtime._http_json", side_effect=fake_http_json):
+            result = action_runtime.submit_analysis(
+                "https://deploywhisper.example.com",
+                [("plan.tf", b"resource")],
+                api_token="token",
+                project_key="payments",
+                project_id="",
+                workspace_key="prod",
+                workspace_id=None,
+                trigger_type="github_pull_request",
+                trigger_id="deploywhisper/example#17",
+            )
+
+        self.assertEqual(result["data"]["persisted_report"]["id"], 42)
+        self.assertEqual(
+            captured["url"], "https://deploywhisper.example.com/api/v1/analyses"
+        )
+        self.assertIn("multipart/form-data", captured["content_type"])
+        self.assertEqual(captured["authorization"], "Bearer token")
+        self.assertIn('name="project_key"', captured["body"])
+        self.assertIn("payments", captured["body"])
+        self.assertIn('name="workspace_key"', captured["body"])
+        self.assertIn("prod", captured["body"])
+        self.assertNotIn('name="project_id"', captured["body"])
+        self.assertNotIn('name="workspace_id"', captured["body"])
+
+    def test_submit_analysis_maps_id_scope_inputs_to_multipart_fields(self) -> None:
+        captured = {}
+
+        def fake_http_json(request_obj):
+            captured["body"] = request_obj.data.decode("utf-8")
+            return {"data": {"persisted_report": {"id": 42}}}
+
+        with patch("action_runtime._http_json", side_effect=fake_http_json):
+            action_runtime.submit_analysis(
+                "https://deploywhisper.example.com",
+                [("plan.tf", b"resource")],
+                api_token=None,
+                project_key=None,
+                project_id="123",
+                workspace_key=None,
+                workspace_id="456",
+                trigger_type="github_workflow_dispatch",
+                trigger_id="github@abcdef123456",
+            )
+
+        self.assertIn('name="project_id"', captured["body"])
+        self.assertIn("123", captured["body"])
+        self.assertIn('name="workspace_id"', captured["body"])
+        self.assertIn("456", captured["body"])
+        self.assertNotIn('name="project_key"', captured["body"])
+        self.assertNotIn('name="workspace_key"', captured["body"])
+
+
+class ScopeInputValidationTests(unittest.TestCase):
+    def test_validate_scope_inputs_requires_project_scope_by_default(self) -> None:
+        with self.assertRaisesRegex(
+            action_runtime.ActionRuntimeError,
+            "Project scope is required",
+        ):
+            action_runtime.validate_scope_inputs(
+                project_key="",
+                project_id="",
+                workspace_key="",
+                workspace_id="",
+                allow_derived_project_scope=False,
+            )
+
+    def test_validate_scope_inputs_allows_explicit_derived_project_scope(self) -> None:
+        scope = action_runtime.validate_scope_inputs(
+            project_key="",
+            project_id="",
+            workspace_key="",
+            workspace_id="",
+            allow_derived_project_scope=True,
+        )
+
+        self.assertEqual(scope["project_key"], "")
+        self.assertEqual(scope["project_id"], "")
+
+    def test_validate_scope_inputs_rejects_project_key_and_id(self) -> None:
+        with self.assertRaisesRegex(
+            action_runtime.ActionRuntimeError,
+            "project-key or project-id",
+        ):
+            action_runtime.validate_scope_inputs(
+                project_key="payments",
+                project_id="123",
+                workspace_key="",
+                workspace_id="",
+                allow_derived_project_scope=False,
+            )
+
+    def test_validate_scope_inputs_rejects_workspace_key_and_id(self) -> None:
+        with self.assertRaisesRegex(
+            action_runtime.ActionRuntimeError,
+            "workspace-key or workspace-id",
+        ):
+            action_runtime.validate_scope_inputs(
+                project_key="payments",
+                project_id="",
+                workspace_key="prod",
+                workspace_id="456",
+                allow_derived_project_scope=False,
+            )
+
+    def test_validate_scope_inputs_rejects_non_numeric_ids(self) -> None:
+        with self.assertRaisesRegex(
+            action_runtime.ActionRuntimeError,
+            "project-id must be a positive numeric id",
+        ):
+            action_runtime.validate_scope_inputs(
+                project_key="",
+                project_id="abc",
+                workspace_key="",
+                workspace_id="",
+                allow_derived_project_scope=False,
+            )
+
+        with self.assertRaisesRegex(
+            action_runtime.ActionRuntimeError,
+            "workspace-id must be a positive numeric id",
+        ):
+            action_runtime.validate_scope_inputs(
+                project_key="payments",
+                project_id="",
+                workspace_key="",
+                workspace_id="prod",
+                allow_derived_project_scope=False,
+            )
+
+    def test_validate_scope_inputs_rejects_newlines(self) -> None:
+        with self.assertRaisesRegex(
+            action_runtime.ActionRuntimeError,
+            "project-key must not contain newline characters",
+        ):
+            action_runtime.validate_scope_inputs(
+                project_key="payments\nother",
+                project_id="",
+                workspace_key="",
+                workspace_id="",
+                allow_derived_project_scope=False,
+            )
+
+
 class RunActionCommentTests(unittest.TestCase):
     def test_run_action_writes_comment_outputs_when_pull_request_comment_is_posted(
         self,
@@ -313,6 +471,10 @@ class RunActionCommentTests(unittest.TestCase):
             args = argparse.Namespace(
                 api_url="https://deploywhisper.example.com",
                 api_token="",
+                project_key="payments",
+                project_id="",
+                workspace_key="",
+                workspace_id="",
                 changed_files="plan.tf",
                 working_directory=str(repo_root),
             )
@@ -320,6 +482,10 @@ class RunActionCommentTests(unittest.TestCase):
                 "meta": {"accepted_artifact_count": 1},
                 "data": {
                     "persisted_report": {"id": 42},
+                    "advisory": {
+                        "severity": "low",
+                        "recommendation": "go",
+                    },
                     "share_summary": {
                         "severity": "high",
                         "recommendation": "no-go",
@@ -394,10 +560,153 @@ class RunActionCommentTests(unittest.TestCase):
             output = output_path.read_text(encoding="utf-8")
             self.assertIn("comment-id=777", output)
             self.assertIn("comment-updated=false", output)
+            self.assertIn("severity=low", output)
+            self.assertIn("recommendation=go", output)
             self.assertIn(
                 "comment-url=https://github.com/deploywhisper/example-repo/issues/17#issuecomment-777",
                 output,
             )
+
+    def test_run_action_uses_workflow_dispatch_trigger_for_manual_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            output_path = repo_root / "github-output.txt"
+            summary_path = repo_root / "step-summary.md"
+            args = argparse.Namespace(
+                api_url="https://deploywhisper.example.com",
+                api_token="",
+                project_key="payments",
+                project_id="",
+                workspace_key="",
+                workspace_id="",
+                changed_files="plan.tf",
+                working_directory=str(repo_root),
+            )
+            context = {
+                "event_name": "workflow_dispatch",
+                "repository": "deploywhisper/action-smoke-consumer",
+                "sha": "abcdef1234567890",
+            }
+            captured = {}
+            analysis_payload = {
+                "meta": {"accepted_artifact_count": 1},
+                "data": {
+                    "persisted_report": {"id": 42},
+                    "advisory": {
+                        "severity": "low",
+                        "recommendation": "go",
+                    },
+                    "share_summary": {
+                        "markdown": "### DeployWhisper LOW · GO",
+                        "json_payload": {
+                            "report_link": "https://deploywhisper.example.com/history?report_id=42",
+                        },
+                    },
+                },
+            }
+            environ = {
+                "GITHUB_OUTPUT": str(output_path),
+                "GITHUB_STEP_SUMMARY": str(summary_path),
+            }
+
+            def fake_submit_analysis(*args, **kwargs):
+                captured["trigger_type"] = kwargs["trigger_type"]
+                captured["trigger_id"] = kwargs["trigger_id"]
+                return analysis_payload
+
+            with (
+                patch(
+                    "action_runtime.select_artifacts_for_upload",
+                    return_value=([("plan.tf", b"resource")], []),
+                ),
+                patch(
+                    "action_runtime.submit_analysis",
+                    side_effect=fake_submit_analysis,
+                ),
+                patch(
+                    "action_runtime.load_github_context",
+                    return_value=context,
+                ),
+            ):
+                exit_code = action_runtime.run_action(args, environ=environ)
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(captured["trigger_type"], "github_workflow_dispatch")
+            self.assertEqual(captured["trigger_id"], "github@abcdef123456")
+
+    def test_run_action_preserves_pull_request_target_trigger_type(self) -> None:
+        context = {"event_name": "pull_request_target"}
+
+        self.assertEqual(
+            action_runtime._build_trigger_type(context),
+            "github_pull_request_target",
+        )
+
+    def test_run_action_falls_back_to_share_summary_for_blank_advisory_outputs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            output_path = repo_root / "github-output.txt"
+            summary_path = repo_root / "step-summary.md"
+            args = argparse.Namespace(
+                api_url="https://deploywhisper.example.com",
+                api_token="",
+                project_key="payments",
+                project_id="",
+                workspace_key="",
+                workspace_id="",
+                changed_files="plan.tf",
+                working_directory=str(repo_root),
+            )
+            context = {
+                "event_name": "workflow_dispatch",
+                "repository": "deploywhisper/action-smoke-consumer",
+                "sha": "abcdef1234567890",
+            }
+            analysis_payload = {
+                "meta": {"accepted_artifact_count": 1},
+                "data": {
+                    "persisted_report": {"id": 42},
+                    "advisory": {
+                        "severity": "",
+                        "recommendation": None,
+                    },
+                    "share_summary": {
+                        "severity": "medium",
+                        "recommendation": "review",
+                        "markdown": "### DeployWhisper MEDIUM · REVIEW",
+                        "json_payload": {
+                            "report_link": "https://deploywhisper.example.com/history?report_id=42",
+                        },
+                    },
+                },
+            }
+            environ = {
+                "GITHUB_OUTPUT": str(output_path),
+                "GITHUB_STEP_SUMMARY": str(summary_path),
+            }
+
+            with (
+                patch(
+                    "action_runtime.select_artifacts_for_upload",
+                    return_value=([("plan.tf", b"resource")], []),
+                ),
+                patch(
+                    "action_runtime.submit_analysis",
+                    return_value=analysis_payload,
+                ),
+                patch(
+                    "action_runtime.load_github_context",
+                    return_value=context,
+                ),
+            ):
+                exit_code = action_runtime.run_action(args, environ=environ)
+
+            self.assertEqual(exit_code, 0)
+            output = output_path.read_text(encoding="utf-8")
+            self.assertIn("severity=medium", output)
+            self.assertIn("recommendation=review", output)
 
     def test_run_action_keeps_report_successful_when_comment_publish_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -407,6 +716,10 @@ class RunActionCommentTests(unittest.TestCase):
             args = argparse.Namespace(
                 api_url="https://deploywhisper.example.com",
                 api_token="",
+                project_key="payments",
+                project_id="",
+                workspace_key="",
+                workspace_id="",
                 changed_files="plan.tf",
                 working_directory=str(repo_root),
             )
@@ -463,6 +776,10 @@ class RunActionCommentTests(unittest.TestCase):
                     return_value=context,
                 ),
                 patch(
+                    "action_runtime.find_existing_pr_comment",
+                    return_value=None,
+                ),
+                patch(
                     "action_runtime.upsert_pr_comment",
                     side_effect=action_runtime.ActionRuntimeError("permission denied"),
                 ),
@@ -485,6 +802,10 @@ class RunActionCommentTests(unittest.TestCase):
             args = argparse.Namespace(
                 api_url="https://deploywhisper.example.com",
                 api_token="",
+                project_key="payments",
+                project_id="",
+                workspace_key="",
+                workspace_id="",
                 changed_files="plan.tf",
                 working_directory=str(repo_root),
             )

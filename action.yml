@@ -12,6 +12,26 @@ inputs:
     description: Optional bearer token for the DeployWhisper API.
     required: false
     default: ""
+  project-key:
+    description: Project key for DeployWhisper project-scoped analysis. Leave blank only when the API endpoint derives project scope.
+    required: false
+    default: ""
+  project-id:
+    description: Numeric project id for DeployWhisper project-scoped analysis. Alternative to project-key.
+    required: false
+    default: ""
+  workspace-key:
+    description: Optional workspace or environment key within the selected project.
+    required: false
+    default: ""
+  workspace-id:
+    description: Optional numeric workspace or environment id within the selected project.
+    required: false
+    default: ""
+  allow-derived-project-scope:
+    description: Set true only when the DeployWhisper API endpoint derives project scope without a project-key or project-id input.
+    required: false
+    default: "true"
   changed-files:
     description: Optional comma or newline separated file list. Defaults to PR diff discovery.
     required: false
@@ -75,5 +95,10 @@ runs:
         python3 "${{ github.action_path }}/run_action.py" \
           --api-url "${{ inputs.api-url }}" \
           --api-token "${{ inputs.api-token }}" \
+          --project-key "${{ inputs.project-key }}" \
+          --project-id "${{ inputs.project-id }}" \
+          --workspace-key "${{ inputs.workspace-key }}" \
+          --workspace-id "${{ inputs.workspace-id }}" \
+          --allow-derived-project-scope "${{ inputs.allow-derived-project-scope }}" \
           --changed-files "${{ inputs.changed-files }}" \
           --working-directory "${{ inputs.working-directory }}"
