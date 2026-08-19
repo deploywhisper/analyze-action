@@ -1,5 +1,5 @@
 name: DeployWhisper Analyze Action
-description: Submit changed infrastructure artifacts from a GitHub pull request to DeployWhisper.
+description: Submit changed infrastructure artifacts to DeployWhisper and enforce the configured GitHub Action policy decision.
 author: DeployWhisper
 branding:
   icon: shield
@@ -59,6 +59,18 @@ outputs:
   report-link:
     description: Report link. Publicly shareable only when APP_BASE_URL or PUBLIC_APP_URL is configured; otherwise it may be local/private.
     value: ${{ steps.deploywhisper.outputs.report-link }}
+  policy-status:
+    description: Raw policy adapter status returned by the enforcement-decision endpoint.
+    value: ${{ steps.deploywhisper.outputs.policy-status }}
+  configured-mode:
+    description: Configured enforcement mode applied for the github-action integration.
+    value: ${{ steps.deploywhisper.outputs.configured-mode }}
+  effective-status:
+    description: Effective capped integration status after applying the configured enforcement mode ceiling.
+    value: ${{ steps.deploywhisper.outputs.effective-status }}
+  should-block:
+    description: Whether the configured github-action enforcement decision should fail the workflow.
+    value: ${{ steps.deploywhisper.outputs.should-block }}
   severity:
     description: Shared risk severity for the generated report.
     value: ${{ steps.deploywhisper.outputs.severity }}

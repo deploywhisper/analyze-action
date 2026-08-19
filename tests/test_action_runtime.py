@@ -1445,6 +1445,154 @@ class SubmitAnalysisTests(unittest.TestCase):
         self.assertNotIn('name="workspace_key"', captured["body"])
 
 
+class EnforcementDecisionTests(unittest.TestCase):
+    def test_fetch_enforcement_decision_uses_expected_endpoint_and_auth(self) -> None:
+        payload = {
+            "data": {
+                "contract_version": "v1",
+                "configured_mode": "warn",
+                "effective_status": "warn",
+                "should_block": False,
+                "policy_output": {
+                    "contract_version": "v1",
+                    "status": "hard-block",
+                    "canonical_report_advisory": True,
+                },
+            }
+        }
+
+        with patch("action_runtime._http_json", return_value=payload) as http_json:
+            decision = action_runtime.fetch_enforcement_decision(
+                "https://deploywhisper.example.com",
+                42,
+                api_token="dw-token",
+            )
+
+        request_obj = http_json.call_args.args[0]
+        self.assertEqual(
+            request_obj.full_url,
+            "https://deploywhisper.example.com/api/v1/analyses/42/enforcement-decision?integration=github-action",
+        )
+        self.assertEqual(request_obj.get_method(), "GET")
+        self.assertIn(("Authorization", "Bearer dw-token"), request_obj.header_items())
+        self.assertEqual(decision["configured_mode"], "warn")
+        self.assertEqual(decision["effective_status"], "warn")
+        self.assertFalse(decision["should_block"])
+        self.assertEqual(decision["policy_status"], "hard-block")
+
+    def test_fetch_enforcement_decision_rejects_invalid_contract(self) -> None:
+        cases = (
+            (
+                {
+                    "data": {
+                        "contract_version": "v1",
+                        "configured_mode": "warn",
+                        "effective_status": "warn",
+                        "should_block": "false",
+                        "policy_output": {
+                            "contract_version": "v1",
+                            "status": "hard-block",
+                            "canonical_report_advisory": True,
+                        },
+                    }
+                },
+                "should_block",
+            ),
+            (
+                {
+                    "data": {
+                        "contract_version": "v1",
+                        "configured_mode": "warn",
+                        "effective_status": "warn",
+                        "should_block": False,
+                        "policy_output": {
+                            "contract_version": "v1",
+                            "canonical_report_advisory": True,
+                        },
+                    }
+                },
+                "policy_output.status",
+            ),
+            (
+                {
+                    "data": {
+                        "contract_version": "v1",
+                        "configured_mode": "nope",
+                        "effective_status": "warn",
+                        "should_block": False,
+                        "policy_output": {
+                            "contract_version": "v1",
+                            "status": "hard-block",
+                            "canonical_report_advisory": True,
+                        },
+                    }
+                },
+                "configured_mode",
+            ),
+            (
+                {
+                    "data": {
+                        "contract_version": "v2",
+                        "configured_mode": "warn",
+                        "effective_status": "warn",
+                        "should_block": False,
+                        "policy_output": {
+                            "contract_version": "v1",
+                            "status": "hard-block",
+                            "canonical_report_advisory": True,
+                        },
+                    }
+                },
+                "contract_version",
+            ),
+            (
+                {
+                    "data": {
+                        "contract_version": "v1",
+                        "configured_mode": "warn",
+                        "effective_status": "warn",
+                        "should_block": True,
+                        "policy_output": {
+                            "contract_version": "v1",
+                            "status": "hard-block",
+                            "canonical_report_advisory": True,
+                        },
+                    }
+                },
+                "effective_status",
+            ),
+            (
+                {
+                    "data": {
+                        "contract_version": "v1",
+                        "configured_mode": "warn",
+                        "effective_status": "warn",
+                        "should_block": False,
+                        "policy_output": {
+                            "contract_version": "v1",
+                            "status": "hard-block",
+                            "canonical_report_advisory": False,
+                        },
+                    }
+                },
+                "canonical_report_advisory",
+            ),
+        )
+
+        for payload, expected_fragment in cases:
+            with self.subTest(expected_fragment=expected_fragment):
+                with patch("action_runtime._http_json", return_value=payload):
+                    with self.assertRaisesRegex(
+                        action_runtime.ActionRuntimeError,
+                        expected_fragment,
+                    ):
+                        action_runtime.fetch_enforcement_decision(
+                            "https://deploywhisper.example.com",
+                            42,
+                            api_token="dw-token",
+                        )
+
+
 class ScopeInputValidationTests(unittest.TestCase):
     def test_validate_scope_inputs_requires_project_scope_by_default(self) -> None:
         with self.assertRaisesRegex(
@@ -1550,6 +1698,110 @@ class ScopeInputValidationTests(unittest.TestCase):
 
 
 class RunActionCommentTests(unittest.TestCase):
+    def _default_enforcement_decision(self) -> dict[str, object]:
+        return {
+            "configured_mode": "warn",
+            "effective_status": "warn",
+            "should_block": False,
+            "policy_status": "hard-block",
+        }
+
+    def test_run_action_exposes_enforcement_outputs_and_exit_codes(self) -> None:
+        cases = (
+            ("advisory", "advisory", "hard-block", False, 0),
+            ("warn", "warn", "hard-block", False, 0),
+            ("soft-block", "soft-block", "hard-block", True, 1),
+            ("hard-block", "hard-block", "hard-block", True, 1),
+        )
+
+        for (
+            configured_mode,
+            effective_status,
+            policy_status,
+            should_block,
+            expected_exit_code,
+        ) in cases:
+            with self.subTest(configured_mode=configured_mode):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    repo_root = Path(tmpdir)
+                    output_path = repo_root / "github-output.txt"
+                    summary_path = repo_root / "step-summary.md"
+                    args = argparse.Namespace(
+                        api_url="https://deploywhisper.example.com",
+                        api_token="dw-token",
+                        project_key="payments",
+                        project_id="",
+                        workspace_key="",
+                        workspace_id="",
+                        changed_files="plan.tf",
+                        working_directory=str(repo_root),
+                    )
+                    analysis_payload = {
+                        "meta": {"accepted_artifact_count": 1},
+                        "data": {
+                            "persisted_report": {"id": 42},
+                            "advisory": {
+                                "severity": "low",
+                                "recommendation": "go",
+                            },
+                            "share_summary": {
+                                "markdown": "### DeployWhisper LOW · GO",
+                                "json_payload": {
+                                    "report_link": "https://deploywhisper.example.com/history?report_id=42",
+                                },
+                            },
+                        },
+                    }
+                    environ = {
+                        "GITHUB_OUTPUT": str(output_path),
+                        "GITHUB_STEP_SUMMARY": str(summary_path),
+                    }
+                    context = {
+                        "event_name": "workflow_dispatch",
+                        "repository": "deploywhisper/action-smoke-consumer",
+                        "sha": "abcdef1234567890",
+                    }
+
+                    with (
+                        patch(
+                            "action_runtime.select_artifacts_for_upload",
+                            return_value=([("plan.tf", b"resource")], []),
+                        ),
+                        patch(
+                            "action_runtime.submit_analysis",
+                            return_value=analysis_payload,
+                        ),
+                        patch(
+                            "action_runtime.fetch_enforcement_decision",
+                            return_value={
+                                "configured_mode": configured_mode,
+                                "effective_status": effective_status,
+                                "should_block": should_block,
+                                "policy_status": policy_status,
+                            },
+                        ) as fetch_enforcement_decision,
+                        patch(
+                            "action_runtime.load_github_context",
+                            return_value=context,
+                        ),
+                    ):
+                        exit_code = action_runtime.run_action(args, environ=environ)
+
+                    self.assertEqual(exit_code, expected_exit_code)
+                    fetch_enforcement_decision.assert_called_once_with(
+                        "https://deploywhisper.example.com",
+                        42,
+                        api_token="dw-token",
+                    )
+                    output = output_path.read_text(encoding="utf-8")
+                    self.assertIn(f"policy-status={policy_status}", output)
+                    self.assertIn(f"configured-mode={configured_mode}", output)
+                    self.assertIn(f"effective-status={effective_status}", output)
+                    self.assertIn(
+                        f"should-block={'true' if should_block else 'false'}",
+                        output,
+                    )
+
     def test_run_action_writes_comment_outputs_when_pull_request_comment_is_posted(
         self,
     ) -> None:
@@ -1627,6 +1879,10 @@ class RunActionCommentTests(unittest.TestCase):
                     return_value=analysis_payload,
                 ),
                 patch(
+                    "action_runtime.fetch_enforcement_decision",
+                    return_value=self._default_enforcement_decision(),
+                ),
+                patch(
                     "action_runtime.load_github_context",
                     return_value=context,
                 ),
@@ -1656,7 +1912,7 @@ class RunActionCommentTests(unittest.TestCase):
                 output,
             )
 
-    def test_run_action_degrades_malformed_api_response_sections(self) -> None:
+    def test_run_action_rejects_malformed_api_response_sections(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             output_path = repo_root / "github-output.txt"
@@ -1715,19 +1971,13 @@ class RunActionCommentTests(unittest.TestCase):
                         "html_url": "https://github.com/deploywhisper/example-repo/issues/17#issuecomment-778",
                         "updated": False,
                     },
-                ) as upsert_pr_comment,
+                ),
             ):
-                exit_code = action_runtime.run_action(args, environ=environ)
-
-            self.assertEqual(exit_code, 0)
-            output = output_path.read_text(encoding="utf-8")
-            summary = summary_path.read_text(encoding="utf-8")
-            self.assertIn("created=true", output)
-            self.assertIn("comment-id=778", output)
-            self.assertIn("Report ID: unavailable", summary)
-            comment_body = upsert_pr_comment.call_args.args[1]
-            self.assertIn("DeployWhisper advisory", comment_body)
-            self.assertIn("Advisory: advisory-only; does not block merge.", comment_body)
+                with self.assertRaisesRegex(
+                    action_runtime.ActionRuntimeError,
+                    "persisted report id",
+                ):
+                    action_runtime.run_action(args, environ=environ)
 
     def test_run_action_uses_workflow_dispatch_trigger_for_manual_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1784,6 +2034,10 @@ class RunActionCommentTests(unittest.TestCase):
                 patch(
                     "action_runtime.submit_analysis",
                     side_effect=fake_submit_analysis,
+                ),
+                patch(
+                    "action_runtime.fetch_enforcement_decision",
+                    return_value=self._default_enforcement_decision(),
                 ),
                 patch(
                     "action_runtime.load_github_context",
@@ -1859,6 +2113,10 @@ class RunActionCommentTests(unittest.TestCase):
                     return_value=analysis_payload,
                 ),
                 patch(
+                    "action_runtime.fetch_enforcement_decision",
+                    return_value=self._default_enforcement_decision(),
+                ),
+                patch(
                     "action_runtime.load_github_context",
                     return_value=context,
                 ),
@@ -1869,6 +2127,110 @@ class RunActionCommentTests(unittest.TestCase):
             output = output_path.read_text(encoding="utf-8")
             self.assertIn("severity=medium", output)
             self.assertIn("recommendation=review", output)
+
+    def test_run_action_rejects_missing_persisted_report_id_for_enforcement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            args = argparse.Namespace(
+                api_url="https://deploywhisper.example.com",
+                api_token="dw-token",
+                project_key="payments",
+                project_id="",
+                workspace_key="",
+                workspace_id="",
+                changed_files="plan.tf",
+                working_directory=str(repo_root),
+            )
+            context = {
+                "event_name": "workflow_dispatch",
+                "repository": "deploywhisper/action-smoke-consumer",
+                "sha": "abcdef1234567890",
+            }
+            analysis_payload = {
+                "meta": {"accepted_artifact_count": 1},
+                "data": {
+                    "persisted_report": {},
+                    "share_summary": {
+                        "markdown": "### DeployWhisper LOW · GO",
+                        "json_payload": {},
+                    },
+                },
+            }
+
+            with (
+                patch(
+                    "action_runtime.select_artifacts_for_upload",
+                    return_value=([("plan.tf", b"resource")], []),
+                ),
+                patch(
+                    "action_runtime.submit_analysis",
+                    return_value=analysis_payload,
+                ),
+                patch(
+                    "action_runtime.load_github_context",
+                    return_value=context,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    action_runtime.ActionRuntimeError,
+                    "persisted report id",
+                ):
+                    action_runtime.run_action(args, environ={})
+
+    def test_run_action_fails_closed_when_enforcement_decision_fetch_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            args = argparse.Namespace(
+                api_url="https://deploywhisper.example.com",
+                api_token="dw-token",
+                project_key="payments",
+                project_id="",
+                workspace_key="",
+                workspace_id="",
+                changed_files="plan.tf",
+                working_directory=str(repo_root),
+            )
+            context = {
+                "event_name": "workflow_dispatch",
+                "repository": "deploywhisper/action-smoke-consumer",
+                "sha": "abcdef1234567890",
+            }
+            analysis_payload = {
+                "meta": {"accepted_artifact_count": 1},
+                "data": {
+                    "persisted_report": {"id": 42},
+                    "share_summary": {
+                        "markdown": "### DeployWhisper LOW · GO",
+                        "json_payload": {},
+                    },
+                },
+            }
+
+            with (
+                patch(
+                    "action_runtime.select_artifacts_for_upload",
+                    return_value=([("plan.tf", b"resource")], []),
+                ),
+                patch(
+                    "action_runtime.submit_analysis",
+                    return_value=analysis_payload,
+                ),
+                patch(
+                    "action_runtime.fetch_enforcement_decision",
+                    side_effect=action_runtime.ActionRuntimeError(
+                        "DeployWhisper enforcement decision request failed."
+                    ),
+                ),
+                patch(
+                    "action_runtime.load_github_context",
+                    return_value=context,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    action_runtime.ActionRuntimeError,
+                    "enforcement decision request failed",
+                ):
+                    action_runtime.run_action(args, environ={})
 
     def test_run_action_rejects_missing_project_scope_when_string_false(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1955,6 +2317,10 @@ class RunActionCommentTests(unittest.TestCase):
                     return_value=analysis_payload,
                 ) as submit_analysis,
                 patch(
+                    "action_runtime.fetch_enforcement_decision",
+                    return_value=self._default_enforcement_decision(),
+                ),
+                patch(
                     "action_runtime.load_github_context",
                     return_value=context,
                 ),
@@ -2033,6 +2399,10 @@ class RunActionCommentTests(unittest.TestCase):
                 patch(
                     "action_runtime.submit_analysis",
                     return_value=analysis_payload,
+                ),
+                patch(
+                    "action_runtime.fetch_enforcement_decision",
+                    return_value=self._default_enforcement_decision(),
                 ),
                 patch(
                     "action_runtime.load_github_context",
@@ -2151,6 +2521,10 @@ class RunActionCommentTests(unittest.TestCase):
                 patch(
                     "action_runtime.submit_analysis",
                     return_value=analysis_payload,
+                ),
+                patch(
+                    "action_runtime.fetch_enforcement_decision",
+                    return_value=self._default_enforcement_decision(),
                 ),
                 patch(
                     "action_runtime.load_github_context",

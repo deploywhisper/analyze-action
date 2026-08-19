@@ -46,6 +46,14 @@ SUPPORTED_TOOL_TYPES = {
     "jenkins",
     "cloudformation",
 }
+POLICY_ADAPTER_STATUSES = {
+    "advisory",
+    "warn",
+    "soft-block",
+    "hard-block",
+}
+BLOCKING_POLICY_ADAPTER_STATUSES = {"soft-block", "hard-block"}
+GITHUB_ACTION_INTEGRATION = "github-action"
 
 
 class ActionRuntimeError(RuntimeError):
@@ -561,6 +569,98 @@ def submit_analysis(
         headers["Authorization"] = f"Bearer {api_token}"
     req = request.Request(endpoint, data=body, headers=headers, method="POST")
     return _http_json(req)
+
+
+def _resolve_enforcement_decision_endpoint(api_url: str, report_id: int) -> str:
+    endpoint = _resolve_analysis_endpoint(api_url)
+    return (
+        f"{endpoint}/{report_id}/enforcement-decision?"
+        f"{parse.urlencode({'integration': GITHUB_ACTION_INTEGRATION})}"
+    )
+
+
+def _validated_policy_adapter_status(value: object, field_name: str) -> str:
+    status = _nonblank_string(value).lower()
+    if status not in POLICY_ADAPTER_STATUSES:
+        raise ActionRuntimeError(
+            "DeployWhisper enforcement decision response contains an invalid "
+            f"`{field_name}` value."
+        )
+    return status
+
+
+def fetch_enforcement_decision(
+    api_url: str,
+    report_id: int,
+    *,
+    api_token: str | None,
+) -> dict[str, object]:
+    if report_id <= 0:
+        raise ActionRuntimeError(
+            "DeployWhisper analysis response is missing a valid persisted report id "
+            "for enforcement decision lookup."
+        )
+
+    headers = {"Accept": "application/json"}
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+    req = request.Request(
+        _resolve_enforcement_decision_endpoint(api_url, report_id),
+        headers=headers,
+        method="GET",
+    )
+    payload = _mapping_or_empty(_http_json(req))
+    data = _mapping_or_empty(payload.get("data"))
+    if not data:
+        raise ActionRuntimeError(
+            "DeployWhisper enforcement decision response is missing the `data` object."
+        )
+
+    policy_output = _mapping_or_empty(data.get("policy_output"))
+    if _nonblank_string(data.get("contract_version")) != "v1":
+        raise ActionRuntimeError(
+            "DeployWhisper enforcement decision response contains an invalid "
+            "`contract_version` value."
+        )
+    if _nonblank_string(policy_output.get("contract_version")) != "v1":
+        raise ActionRuntimeError(
+            "DeployWhisper enforcement decision response contains an invalid "
+            "`policy_output.contract_version` value."
+        )
+    if policy_output.get("canonical_report_advisory") is not True:
+        raise ActionRuntimeError(
+            "DeployWhisper enforcement decision response contains an invalid "
+            "`policy_output.canonical_report_advisory` value."
+        )
+
+    configured_mode = _validated_policy_adapter_status(
+        data.get("configured_mode"), "configured_mode"
+    )
+    effective_status = _validated_policy_adapter_status(
+        data.get("effective_status"), "effective_status"
+    )
+    policy_status = _validated_policy_adapter_status(
+        policy_output.get("status"), "policy_output.status"
+    )
+    should_block = data.get("should_block")
+    if not isinstance(should_block, bool):
+        raise ActionRuntimeError(
+            "DeployWhisper enforcement decision response contains an invalid "
+            "`should_block` value."
+        )
+    expected_should_block = effective_status in BLOCKING_POLICY_ADAPTER_STATUSES
+    if should_block != expected_should_block:
+        raise ActionRuntimeError(
+            "DeployWhisper enforcement decision response contains an invalid "
+            "`should_block` value for the reported `effective_status`."
+        )
+
+    return {
+        "configured_mode": configured_mode,
+        "effective_status": effective_status,
+        "should_block": should_block,
+        "policy_status": policy_status,
+    }
 
 
 def _scan_meta_marker(scan_meta: dict[str, object]) -> str:
@@ -1594,6 +1694,7 @@ def _success_summary(
     changed_files: list[str],
     uploaded_files: list[tuple[str, bytes]],
     skipped_files: list[str],
+    enforcement_decision: dict[str, object] | None = None,
 ) -> str:
     analysis_payload = _mapping_or_empty(analysis_payload)
     data = _mapping_or_empty(analysis_payload.get("data"))
@@ -1611,6 +1712,15 @@ def _success_summary(
     ]
     if report_link:
         lines.append(f"- Report link: {report_link}")
+    if enforcement_decision:
+        lines.extend(
+            [
+                f"- Policy status: {enforcement_decision['policy_status']}",
+                f"- Configured mode: {enforcement_decision['configured_mode']}",
+                f"- Effective status: {enforcement_decision['effective_status']}",
+                f"- Should block: {'yes' if enforcement_decision['should_block'] else 'no'}",
+            ]
+        )
     if skipped_files:
         lines.append("- Skipped files:")
         lines.extend(f"  - {item}" for item in skipped_files)
@@ -1780,6 +1890,13 @@ def run_action(args: argparse.Namespace, environ: dict[str, str] | None = None) 
     share_summary = _mapping_or_empty(data.get("share_summary"))
     share_json = _mapping_or_empty(share_summary.get("json_payload"))
     persisted_report = _mapping_or_empty(data.get("persisted_report"))
+    report_id = _safe_int(persisted_report.get("id"))
+    enforcement_decision = fetch_enforcement_decision(
+        args.api_url,
+        report_id,
+        api_token=args.api_token or None,
+    )
+    exit_code = 1 if enforcement_decision["should_block"] else 0
 
     write_github_output("created", "true", env)
     write_github_output(
@@ -1787,8 +1904,16 @@ def run_action(args: argparse.Namespace, environ: dict[str, str] | None = None) 
         meta.get("accepted_artifact_count", len(upload_files)),
         env,
     )
-    write_github_output("report-id", persisted_report.get("id", ""), env)
+    write_github_output("report-id", report_id, env)
     write_github_output("report-link", share_json.get("report_link", ""), env)
+    write_github_output("policy-status", enforcement_decision["policy_status"], env)
+    write_github_output(
+        "configured-mode", enforcement_decision["configured_mode"], env
+    )
+    write_github_output(
+        "effective-status", enforcement_decision["effective_status"], env
+    )
+    write_github_output("should-block", enforcement_decision["should_block"], env)
     write_github_output(
         "severity",
         _nonblank_string(advisory.get("severity"))
@@ -1847,6 +1972,7 @@ def run_action(args: argparse.Namespace, environ: dict[str, str] | None = None) 
             changed_files=changed_files,
             uploaded_files=upload_files,
             skipped_files=skipped_files,
+            enforcement_decision=enforcement_decision,
         )
     ]
     summary_sections.extend(extra_summary_sections)
@@ -1854,7 +1980,7 @@ def run_action(args: argparse.Namespace, environ: dict[str, str] | None = None) 
         "\n\n".join(summary_sections),
         env,
     )
-    return 0
+    return exit_code
 
 
 def main() -> None:

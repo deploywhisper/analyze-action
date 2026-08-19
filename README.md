@@ -1,15 +1,16 @@
 # DeployWhisper Analyze Action
 
 Submit changed infrastructure artifacts from GitHub pull requests to a
-DeployWhisper API endpoint, publish advisory outputs, and maintain one stable
-pull request comment across reruns.
+DeployWhisper API endpoint, consume the server's GitHub Action enforcement
+decision, and maintain one stable pull request comment across reruns.
 
 ## Highlights
 
 - Sends supported changed artifacts to `POST /api/v1/analyses`.
+- Follows each successful analysis with `GET /api/v1/analyses/{report_id}/enforcement-decision?integration=github-action`.
 - Supports explicit project and workspace scope inputs.
-- Keeps risk verdicts advisory: successful analysis exits `0` even when
-  DeployWhisper recommends additional human review.
+- Preserves advisory and warn modes as exit `0`, and returns non-zero only when
+  the server's configured decision sets `should_block=true`.
 - Posts or updates one DeployWhisper pull request comment.
 - Uses only Python standard library modules inside the action runtime.
 
@@ -66,6 +67,10 @@ jobs:
 | `accepted-artifact-count` | Number of artifacts accepted by the API. |
 | `report-id` | Persisted DeployWhisper report id. |
 | `report-link` | Report link. Publicly shareable only when `APP_BASE_URL` or `PUBLIC_APP_URL` is configured server-side; otherwise it may be local/private and consumers should treat it as optional. |
+| `policy-status` | Raw `data.policy_output.status` returned by the enforcement-decision endpoint. |
+| `configured-mode` | `data.configured_mode` for the `github-action` integration. |
+| `effective-status` | `data.effective_status` after the configured mode ceiling is applied. |
+| `should-block` | `data.should_block`. `true` causes the action to exit non-zero after outputs and summaries are written. |
 | `severity` | Advisory severity. Uses `data.advisory.severity`, falling back to `data.share_summary.severity` when advisory is blank. |
 | `recommendation` | Advisory recommendation. Uses `data.advisory.recommendation`, falling back to `data.share_summary.recommendation` when advisory is blank. |
 | `share-summary-json` | JSON-encoded `data.share_summary.json_payload`. |
@@ -80,6 +85,12 @@ jobs:
 - Detects changed files from the pull request diff.
 - Filters unsupported and sensitive files locally before upload.
 - Submits explicit project and optional workspace scope when configured.
+- Requires a valid persisted report id from `POST /api/v1/analyses`, then
+  validates the `v1` enforcement-decision contract instead of re-deriving
+  policy locally from advisory severity or recommendation.
+- Fails closed when the enforcement-decision request is missing, malformed,
+  operationally broken, or internally inconsistent with its own
+  `effective_status`.
 - Posts a concise advisory PR comment with verdict, Evidence Law status,
   top risks with evidence counts, blast radius, rollback, incident/public
   pattern matches, scanner context, uncertainty, and report links.
@@ -91,6 +102,16 @@ jobs:
   available.
 - Treats malformed previous scan markers as absent so comment updates can still
   proceed.
+
+## Exit Behavior
+
+- `configured-mode=advisory` and `configured-mode=warn` always keep the action
+  exit code at `0`.
+- `configured-mode=soft-block` or `configured-mode=hard-block` return a non-zero
+  exit only when the server's `should-block` output is `true`.
+- Advisory outputs remain available even when the action exits non-zero for CI
+  enforcement, so downstream steps can still inspect the report id, report
+  link, and policy metadata.
 
 ## Marketplace Release
 
