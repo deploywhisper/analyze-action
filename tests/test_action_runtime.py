@@ -1577,6 +1577,22 @@ class EnforcementDecisionTests(unittest.TestCase):
                 },
                 "canonical_report_advisory",
             ),
+            (
+                {
+                    "data": {
+                        "contract_version": "v1",
+                        "configured_mode": "hard-block",
+                        "effective_status": "advisory",
+                        "should_block": False,
+                        "policy_output": {
+                            "contract_version": "v1",
+                            "status": "hard-block",
+                            "canonical_report_advisory": True,
+                        },
+                    }
+                },
+                "effective_status",
+            ),
         )
 
         for payload, expected_fragment in cases:

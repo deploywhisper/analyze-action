@@ -52,6 +52,12 @@ POLICY_ADAPTER_STATUSES = {
     "soft-block",
     "hard-block",
 }
+POLICY_ADAPTER_STATUS_RANK = {
+    "advisory": 0,
+    "warn": 1,
+    "soft-block": 2,
+    "hard-block": 3,
+}
 BLOCKING_POLICY_ADAPTER_STATUSES = {"soft-block", "hard-block"}
 GITHUB_ACTION_INTEGRATION = "github-action"
 
@@ -642,6 +648,15 @@ def fetch_enforcement_decision(
     policy_status = _validated_policy_adapter_status(
         policy_output.get("status"), "policy_output.status"
     )
+    expected_effective_status = min(
+        (policy_status, configured_mode),
+        key=POLICY_ADAPTER_STATUS_RANK.__getitem__,
+    )
+    if effective_status != expected_effective_status:
+        raise ActionRuntimeError(
+            "DeployWhisper enforcement decision response contains an invalid "
+            "`effective_status` value for the reported policy status and configured mode."
+        )
     should_block = data.get("should_block")
     if not isinstance(should_block, bool):
         raise ActionRuntimeError(
